@@ -1,0 +1,146 @@
+// enc_render_tests — the OpenSCAD text rendered by OpenSCAD, and the
+// rendered meshes compared with what the model computed.
+//
+// The suite runs OpenSCAD 2021.01 or later, installed as the Flatpak
+// `org.openscad.OpenSCAD`, and skips every test with a note when it is
+// not there.  For each variant of the housing it renders every part to
+// an STL.  A render that prints an error or a warning, or that does not
+// say its result is simple (a manifold), fails.  Each part's mesh is then
+// read back with stl-nv and compared with the bounding box and the
+// volume `encbill` computed for it.  The scratch files go to tests/_work,
+// because a Flatpak sees the home directory and not /tmp.
+
+use std.test
+use std.fs
+use std.process
+use kpcbread
+use encmodel
+use encparams
+use encscad
+use encbill
+
+// Whether the OpenSCAD Flatpak is installed.
+fn have_openscad() -> Bool [io]
+    match process.run_ok("command -v flatpak > /dev/null && flatpak info org.openscad.OpenSCAD > /dev/null 2>&1")
+        Some(_) => true
+        None    => false
+
+// Runs a shell command and answers its status and output as `status: output`.
+fn sh(cmd: Str) -> Str [io]
+    match process.run(cmd)
+        (out, code) => "${code}: ${out}"
+
+// Whether a render ended well: status 0, no error, no warning, and a
+// simple result.
+fn clean(said: Str) -> Bool
+    str.starts_with(said, "0: ") and not str.contains(said, "ERROR") and not str.contains(said, "WARNING") and str.contains(said, "Simple:        yes")
+
+// The parameters of a variant of the housing.
+fn variant(name: Str) -> Params
+    var p = encparams.defaults()
+    p.name = name
+    if name == "snap" or name == "rect4"
+        p.lid = LidSnap
+    if name == "parts"
+        p.led = LedPipe
+        p.button = ButtonCap
+        p.extras = [encparams.lid_extra("vent", 115.0, 117.0, 6.0, 2.0),
+            encparams.floor_extra("drain", 110.0, 105.0, 4.0, 4.0),
+            encparams.side_extra("slot", 0, 10.0, 1.5, 6.0, 2.5)]
+    if name == "rounded"
+        p.top_space = 4.0
+    p
+
+// The fixture each variant is made from.
+fn board_name(name: Str) -> Str
+    if name == "rect4" or name == "rounded" or name == "cutouts"
+        name
+    else
+        "usbc_board"
+
+// The bill line named `part`, or a stand-in.
+fn line_of(lines: [BillLine], part: Str) -> BillLine
+    match list.find(lines, l => l.part == part)
+        Some(l) => l
+        None    => BillLine { part: "missing ${part}",
+            kind: "",
+            count: 0,
+            x0: 0.0,
+            y0: 0.0,
+            z0: 0.0,
+            x1: 0.0,
+            y1: 0.0,
+            z1: 0.0,
+            volume: 1.0 }
+
+// Renders every file of the variant `name`, compares each part's mesh
+// with its bill line, and answers the problems found, one per line.
+fn problems(name: Str) -> Str [io, fs]
+    fs.mkdir_all("tests/_work")
+    var out: [Str] = []
+    match fs.read_bytes("tests/fixtures/${board_name(name)}.kicad_pcb")
+        None    => list.push(out, "no fixture")
+        Some(s) =>
+            match kpcbread.read(s, name)
+                Err(e) => list.push(out, e.message())
+                Ok(b)  =>
+                    let h = encmodel.build(b, variant(name))
+                    let lines = encbill.bill(h)
+                    for f in encscad.files(h)
+                        let scad = "tests/_work/${f.name}"
+                        let stl = "tests/_work/${f.name}.stl"
+                        fs.write(scad, f.text)
+                        let said = sh("flatpak run org.openscad.OpenSCAD -o ${stl} ${scad} 2>&1")
+                        if not clean(said)
+                            list.push(out, "${f.name}: ${said}")
+                        elif not str.ends_with(f.name, "_assembly.scad")
+                            let part = str.slice(f.name, str.len(name) + 1, str.len(f.name) - 5)
+                            match fs.read_bytes(stl)
+                                None    => list.push(out, "${f.name}: no mesh")
+                                Some(m) =>
+                                    let r = encbill.mesh_report(line_of(lines, part), m, 0.002)
+                                    if not r.ok
+                                        list.push(out, r.detail)
+    str.join(out, "\n")
+
+@test
+fn test_the_screwed_lid_renders_and_its_meshes_match_the_model() [io, fs]
+    if not have_openscad()
+        println("skipped: the OpenSCAD Flatpak is not installed")
+        return
+    test.assert_eq(problems("screwed"), "")
+
+@test
+fn test_the_snap_lid_renders_and_its_meshes_match_the_model() [io, fs]
+    if not have_openscad()
+        println("skipped: the OpenSCAD Flatpak is not installed")
+        return
+    test.assert_eq(problems("snap"), "")
+
+@test
+fn test_pipes_caps_and_extra_openings_render_and_match_the_model() [io, fs]
+    if not have_openscad()
+        println("skipped: the OpenSCAD Flatpak is not installed")
+        return
+    test.assert_eq(problems("parts"), "")
+
+@test
+fn test_a_board_with_rounded_corners_renders_and_matches_the_model() [io, fs]
+    if not have_openscad()
+        println("skipped: the OpenSCAD Flatpak is not installed")
+        return
+    test.assert_eq(problems("rounded"), "")
+
+@test
+fn test_four_holes_and_a_snap_lid_render_and_match_the_model() [io, fs]
+    if not have_openscad()
+        println("skipped: the OpenSCAD Flatpak is not installed")
+        return
+    test.assert_eq(problems("rect4"), "")
+
+@test
+fn test_a_board_with_cut_outs_renders_its_assembly_and_matches_the_model() [io, fs]
+    if not have_openscad()
+        println("skipped: the OpenSCAD Flatpak is not installed")
+        return
+    test.assert_eq(problems("cutouts"), "")

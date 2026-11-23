@@ -1,0 +1,226 @@
+// encbill — the parts of a housing, measured.
+//
+// `bill` lists what is printed, with the bounding box of one part and
+// its volume, and what is bought.  A bounding box and a volume come from
+// the model and the formulas of the parts, not from a rendered mesh:
+// the area of a polygon grown by a distance is the area of the polygon
+// with every corner moved to the meeting of the offset edges, the volume
+// of a cylinder is that of the polygon with `CYL_FN` sides, and a hole
+// takes out the volume of the material it passes through.  The volumes
+// are exact for an outline whose offset has no edge that disappears, and
+// `mesh_report` compares them with a mesh rendered from the text.
+
+use std.bytes
+use stlmesh
+use stlread
+use kpcbgeom
+use encgeom
+use encmodel
+use encparams
+
+// A line of the bill.
+//
+// `kind` is `printed` or `purchased`.  `count` is the number of copies.
+// The box `(x0, y0, z0)` to `(x1, y1, z1)` and the `volume` in cubic
+// millimetres are those of one copy, in the assembled position of the
+// housing frame, and are zero for a purchased part, whose `part` names
+// its size.
+pub struct BillLine
+    part: Str
+    kind: Str
+    count: Int
+    x0: Float
+    y0: Float
+    z0: Float
+    x1: Float
+    y1: Float
+    z1: Float
+    volume: Float
+
+// The comparison of a rendered mesh with the model's box and volume.
+//
+// `box_error` is the largest difference, in millimetres, between a
+// face of the mesh's bounding box and the model's.  `ratio` is the
+// mesh's volume over the model's.
+pub struct MeshReport
+    ok: Bool
+    box_error: Float
+    ratio: Float
+    detail: Str
+
+// The volume a wall opening takes out of the base: the opening's width
+// times the wall's thickness at each height it covers.  The outer half
+// of the wall stops at the step.
+fn wall_cut_base(h: Housing, o: Opening) -> Float
+    let p = h.params
+    let a_in = p.wall / 2.0
+    o.w * (p.wall * encgeom.overlap(o.z0, o.z1, p.floor_t, h.z_step) + a_in * encgeom.overlap(o.z0, o.z1, h.z_step, h.z_split))
+
+// The volume a wall opening takes out of the lid's skirt.
+fn wall_cut_lid(h: Housing, o: Opening) -> Float
+    let p = h.params
+    o.w * (p.wall - p.wall / 2.0 - p.lid_gap) * encgeom.overlap(o.z0, o.z1, h.z_skirt, h.z_split)
+
+// The volume a plate opening takes out of a plate `t` thick.
+fn plate_cut(o: Opening, t: Float) -> Float
+    if o.shape == "round"
+        encgeom.cyl_area(o.w) * t
+    else
+        o.w * o.h * t
+
+// The bounding box of the housing's outer outline, as
+// `[x0, y0, x1, y1]`.
+fn outer_box(h: Housing) -> [Float]
+    let r = kpcbgeom.bounds(encgeom.offset_poly(h.outline, h.params.clear + h.params.wall))
+    [r.x0, r.y0, r.x1, r.y1]
+
+// The volume of the base.
+fn base_volume(h: Housing) -> Float
+    let p = h.params
+    let a_in = p.wall / 2.0
+    let a_out = encgeom.offset_area(h.outline, p.clear + p.wall)
+    let a_mid = encgeom.offset_area(h.outline, p.clear + a_in)
+    let a_cav = encgeom.offset_area(h.outline, p.clear)
+    let posts = list.len(h.posts) as Float
+    var v = a_out * p.floor_t + (a_mid - a_cav) * (h.z_split - p.floor_t) + (a_out - a_mid) * (h.z_step - p.floor_t)
+    v += posts * encgeom.cyl_area(p.standoff_d) * (h.z_bb - p.floor_t)
+    if p.lid == LidSnap
+        v -= posts * encgeom.cyl_area(p.pilot_d) * h.pilot_len
+        v -= (encgeom.offset_area(h.outline, p.clear + a_in) - encgeom.offset_area(h.outline, p.clear + a_in - p.snap_depth)) * (p.snap_h + 0.2)
+    else
+        let clear_d = p.screw_d + 0.3
+        v -= posts * (encgeom.cyl_area(clear_d) * h.z_bb + (encgeom.cyl_area(p.head_d + 0.4) - encgeom.cyl_area(clear_d)) * p.head_h)
+    for o in h.openings
+        if o.part == "both"
+            v -= wall_cut_base(h, o)
+        elif o.part == "base"
+            v -= plate_cut(o, p.floor_t)
+    v
+
+// The volume of the lid.
+fn lid_volume(h: Housing) -> Float
+    let p = h.params
+    let a_in = p.wall / 2.0
+    let a_out = encgeom.offset_area(h.outline, p.clear + p.wall)
+    let x_in = p.clear + a_in + p.lid_gap
+    let posts = list.len(h.posts) as Float
+    var v = a_out * p.lid_t + (a_out - encgeom.offset_area(h.outline, x_in)) * (h.z_split - h.z_skirt)
+    if p.lid == LidSnap
+        v += (encgeom.offset_area(h.outline, x_in) - encgeom.offset_area(h.outline, x_in - p.snap_depth)) * p.snap_h
+    else
+        v += posts * (encgeom.cyl_area(p.standoff_d) * (h.z_split - h.z_bt) - encgeom.cyl_area(p.pilot_d) * h.pilot_len)
+    for o in h.openings
+        if o.part == "both"
+            v -= wall_cut_lid(h, o)
+        elif o.part == "lid"
+            v -= plate_cut(o, p.lid_t)
+    v
+
+// The volume of a pipe or a cap: its stem, and the part of its flange
+// that is outside the stem.
+fn cap_volume(c: Cap) -> Float
+    encgeom.cyl_area(c.stem_d) * (c.z1 - c.z0) + (encgeom.cyl_area(c.flange_d) - encgeom.cyl_area(c.stem_d)) * (c.fz1 - c.fz0)
+
+// The bill of the housing: the base, the lid, each light pipe and
+// button cap, and the screws.
+//
+// ```novo
+// use std.bytes
+// use kpcbread
+// use encmodel
+// use encparams
+// use encbill
+//
+// fn main() [io]
+//     let src = bytes.from_str("(kicad_pcb (version 20241229) (gr_rect (start 0 0) (end 20 10) (layer Edge.Cuts)))")
+//     match kpcbread.read(src, "a.kicad_pcb")
+//         Err(e) => println(e.message())
+//         Ok(b)  =>
+//             let lines = encbill.bill(encmodel.build(b, encparams.defaults()))
+//             println(lines[0].part)   // base
+// ```
+pub fn bill(h: Housing) -> [BillLine] []
+    let box = outer_box(h)
+    let p = h.params
+    let lid_z0 = if p.lid == LidScrewed and list.len(h.posts) > 0
+        math.min(h.z_bt, h.z_skirt)
+    else
+        h.z_skirt
+    var out: [BillLine] = [
+        BillLine { part: "base",
+        kind: "printed",
+        count: 1,
+        x0: box[0],
+        y0: box[1],
+        z0: 0.0,
+        x1: box[2],
+        y1: box[3],
+        z1: h.z_split,
+        volume: base_volume(h) },
+        BillLine { part: "lid",
+        kind: "printed",
+        count: 1,
+        x0: box[0],
+        y0: box[1],
+        z0: lid_z0,
+        x1: box[2],
+        y1: box[3],
+        z1: h.z_top,
+        volume: lid_volume(h) }]
+    for c in h.caps
+        let r = c.flange_d / 2.0
+        list.push(out, BillLine { part: "${c.kind}_${c.ref}",
+            kind: "printed",
+            count: 1,
+            x0: c.x - r,
+            y0: c.y - r,
+            z0: c.z0,
+            x1: c.x + r,
+            y1: c.y + r,
+            z1: c.z1,
+            volume: cap_volume(c) })
+    if list.len(h.posts) > 0 and h.screw_len > 0.0
+        list.push(out, BillLine { part: "screw M${short(p.screw_d)} x ${short(h.screw_len)}",
+            kind: "purchased",
+            count: list.len(h.posts),
+            x0: 0.0,
+            y0: 0.0,
+            z0: 0.0,
+            x1: 0.0,
+            y1: 0.0,
+            z1: 0.0,
+            volume: 0.0 })
+    out
+
+// A number as short text for a part's name.
+fn short(x: Float) -> Str
+    str.from_float(math.round(x * 100.0) / 100.0)
+
+// Compares a rendered mesh with a line of the bill.
+//
+// The mesh is the bytes of an STL file.  The report is `ok` when each
+// face of the mesh's bounding box is within 0.01 mm of the model's and
+// the mesh's volume is within `vol_tol` of the model's, as a fraction.
+pub fn mesh_report(line: BillLine, stl: Bytes, vol_tol: Float) -> MeshReport []
+    match stlread.read(stl)
+        Err(e) => MeshReport { ok: false,
+            box_error: -1.0,
+            ratio: 0.0,
+            detail: "the mesh does not read: ${e.message()}" }
+        Ok(m)  => mesh_against(line, m, vol_tol)
+
+// The comparison of a read mesh with a line of the bill.
+fn mesh_against(line: BillLine, m: stlmesh.StlMesh, vol_tol: Float) -> MeshReport
+    let box = stlmesh.bounds(m)
+    var err = math.abs(box.min_x - line.x0)
+    err = math.max(err, math.abs(box.min_y - line.y0))
+    err = math.max(err, math.abs(box.min_z - line.z0))
+    err = math.max(err, math.abs(box.max_x - line.x1))
+    err = math.max(err, math.abs(box.max_y - line.y1))
+    err = math.max(err, math.abs(box.max_z - line.z1))
+    let ratio = stlmesh.volume(m) / line.volume
+    let ok = err <= 0.01 and math.abs(ratio - 1.0) <= vol_tol
+    MeshReport { ok: ok,
+        box_error: err,
+        ratio: ratio,
+        detail: "${line.part}: box off by ${err} mm, volume ${stlmesh.volume(m)} against ${line.volume}" }

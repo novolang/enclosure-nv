@@ -1,0 +1,374 @@
+// encchecks — what is tested of a housing without a renderer.
+//
+// Every check is a statement about the model that `encmodel.build`
+// computed, made from numbers and not from a rendered mesh:
+//
+//   wall-min          every wall, plate, rim, skirt and standoff wall is
+//                     at least two nozzle widths thick
+//   feature-min       no opening is narrower than the smallest feature
+//   opening-in-wall   every wall opening lies in the straight part of
+//                     its wall, above the floor and below the lid
+//   opening-in-plate  every opening in the lid or the floor lies over
+//                     the board
+//   post-clear        every standoff and every lid pillar keeps its
+//                     distance from the parts of the board
+//   screw-hole-fit    the board's hole is wider than the screw
+//   post-on-board     every standoff stands wholly on the board
+//   lid-headroom      the lid closes over the tallest part with the
+//                     headroom that was asked for
+//   bottom-headroom   the space under the board holds its tallest part
+//                     with the headroom that was asked for
+//   in-cavity         every part without an opening lies inside the
+//                     wall, with the clearance
+//   screw-fit         a standard screw exists and its hole fits in the
+//                     standoff or the pillar and leaves a skin
+//   mount-holes       the board has a mounting hole to hold it by
+//   connector-reach   every connector has an opening or a place in one
+//   heights-known     every part has a height that is a fact
+//
+// The last two are warnings, which do not make a housing fail.  The rest
+// are errors.  A test is exact to a thousandth of a millimetre.
+
+use kpcbgeom
+use encmodel
+use encparams
+
+// The tolerance of every comparison, in millimetres.
+const EPS = 0.001
+
+// One test and its verdict.  `severity` is `error` or `warning`, and
+// `detail` says in a sentence what was measured or which part failed.
+pub struct Check
+    name: Str
+    ok: Bool
+    severity: Str
+    detail: Str
+
+// A check that passed or failed with the given detail.
+fn verdict(name: Str, severity: Str, bad: [Str], good: Str) -> Check
+    if list.len(bad) == 0
+        Check { name: name, ok: true, severity: severity, detail: good }
+    else
+        Check { name: name, ok: false, severity: severity, detail: str.join(bad, "; ") }
+
+// The number as a short piece of text for a detail.
+fn n(x: Float) -> Str
+    str.from_float(math.round(x * 1000.0) / 1000.0)
+
+// The outline segment of the housing that the board file's segment
+// `seg` becomes: the housing reverses the file's order.
+fn housing_segment(h: Housing, seg: Int) -> Int
+    let count = list.len(h.outline)
+    ((count - 2 - seg) % count + count) % count
+
+// The thicknesses that must be at least two nozzle widths, as names and
+// values in two lists.
+fn thicknesses(h: Housing) -> [Float]
+    let p = h.params
+    let hole = if p.lid == LidSnap
+        p.pilot_d
+    else
+        p.screw_d + 0.3
+    var out = [p.wall,
+        p.floor_t,
+        p.lid_t,
+        p.wall / 2.0,
+        p.wall / 2.0 - p.lid_gap,
+        (p.standoff_d - hole) / 2.0]
+    if p.lid == LidScrewed
+        list.push(out, (p.standoff_d - p.pilot_d) / 2.0)
+        list.push(out, p.floor_t - p.head_h)
+    else
+        list.push(out, p.wall / 2.0 - p.snap_depth)
+    out
+
+// The names that go with `thicknesses`.
+fn thickness_names(h: Housing) -> [Str]
+    var out = ["wall", "floor", "lid", "inner rim", "lid skirt", "standoff wall"]
+    if h.params.lid == LidScrewed
+        list.push(out, "pillar wall")
+        list.push(out, "floor under the screw head")
+    else
+        list.push(out, "rim behind the groove")
+    out
+
+// Every wall, plate and standoff wall is at least two nozzle widths.
+fn wall_min(h: Housing) -> Check
+    let least = 2.0 * h.params.nozzle
+    let vals = thicknesses(h)
+    let names = thickness_names(h)
+    var bad: [Str] = []
+    for i in 0..list.len(vals)
+        if vals[i] < least - EPS
+            list.push(bad, "${names[i]} is ${n(vals[i])} mm")
+    verdict("wall-min",
+        "error",
+        bad,
+        "every wall is at least ${n(least)} mm thick, the thinnest ${n(math.min(vals[0], math.min(vals[1], math.min(vals[2], math.min(vals[3], vals[4])))))} mm")
+
+// The smallest size across an opening.
+fn smallest(o: Opening) -> Float
+    if o.shape == "round"
+        o.w
+    else
+        math.min(o.w, o.h)
+
+// No opening, pipe or cap is thinner than the smallest feature.
+fn feature_min(h: Housing) -> Check
+    var bad: [Str] = []
+    for o in h.openings
+        if smallest(o) < h.params.min_feature - EPS
+            list.push(bad, "${o.name} is ${n(smallest(o))} mm across")
+    for c in h.caps
+        if c.stem_d < h.params.min_feature - EPS
+            list.push(bad, "${c.kind} ${c.ref} is ${n(c.stem_d)} mm across")
+    verdict("feature-min",
+        "error",
+        bad,
+        "every opening and pin is at least ${n(h.params.min_feature)} mm across")
+
+// Why a wall opening is not inside its wall, or the empty string.
+fn wall_fault(h: Housing, o: Opening) -> Str
+    let count = list.len(h.outline)
+    let j = housing_segment(h, o.seg)
+    if o.seg < 0 or o.seg >= count
+        return "${o.name} names no outline segment"
+    let len = kpcbgeom.dist(h.outline[j], h.outline[(j + 1) % count])
+    let wall = h.params.wall
+    if o.along - o.w / 2.0 < wall - EPS or o.along + o.w / 2.0 > len - wall + EPS
+        return "${o.name} is ${n(o.w)} mm wide on a wall of ${n(len)} mm, which leaves less than ${n(wall)} mm to the corner"
+    if o.z0 < h.params.floor_t - EPS
+        return "${o.name} starts at z = ${n(o.z0)}, below the floor's top at ${n(h.params.floor_t)}"
+    if o.z1 > h.z_split + EPS
+        return "${o.name} ends at z = ${n(o.z1)}, above the wall's top at ${n(h.z_split)}"
+    ""
+
+// Every wall opening lies in the straight part of its wall.
+fn opening_in_wall(h: Housing) -> Check
+    var bad: [Str] = []
+    var count = 0
+    for o in h.openings
+        if o.part == "both"
+            count += 1
+            let why = wall_fault(h, o)
+            if why != ""
+                list.push(bad, why)
+    verdict("opening-in-wall",
+        "error",
+        bad,
+        "${count} wall opening(s), each in the straight part of its wall")
+
+// Whether the points that bound a plate opening are over the board.
+fn over_board(h: Housing, o: Opening) -> Bool
+    let rx = o.w / 2.0
+    let ry = if o.shape == "round"
+        o.w / 2.0
+    else
+        o.h / 2.0
+    let pts = [Pt { x: o.cx - rx, y: o.cy },
+        Pt { x: o.cx + rx, y: o.cy },
+        Pt { x: o.cx, y: o.cy - ry },
+        Pt { x: o.cx, y: o.cy + ry },
+        Pt { x: o.cx - rx, y: o.cy - ry },
+        Pt { x: o.cx + rx, y: o.cy + ry },
+        Pt { x: o.cx - rx, y: o.cy + ry },
+        Pt { x: o.cx + rx, y: o.cy - ry }]
+    list.all(pts, q => kpcbgeom.inside(h.outline, q))
+
+// Every opening in the lid or the floor lies over the board.
+fn opening_in_plate(h: Housing) -> Check
+    var bad: [Str] = []
+    var count = 0
+    for o in h.openings
+        if o.part != "both"
+            count += 1
+            if not over_board(h, o)
+                list.push(bad, "${o.name} reaches past the board's outline")
+    verdict("opening-in-plate", "error", bad, "${count} plate opening(s), each over the board")
+
+// The distance between the edge of a post at (x, y) and a block.
+fn post_gap(q: Post, d: Float, k: Block) -> Float
+    kpcbgeom.rect_dist(kpcbgeom.rect(k.x0, k.y0, k.x1, k.y1), Pt { x: q.x, y: q.y }) - d / 2.0
+
+// Every standoff and every lid pillar keeps its distance from the parts.
+fn post_clear(h: Housing) -> Check
+    var bad: [Str] = []
+    let want = h.params.post_clear
+    for q in h.posts
+        for k in h.blocks
+            let under = k.side == "B"
+            let pillar_hits = k.side == "F" and h.params.lid == LidScrewed
+            if under or pillar_hits
+                let gap = post_gap(q, h.params.standoff_d, k)
+                if gap < want - EPS
+                    let what = if under
+                        "standoff"
+                    else
+                        "pillar"
+                    list.push(bad, "the ${what} at ${q.ref} is ${n(gap)} mm from ${k.ref}")
+    verdict("post-clear",
+        "error",
+        bad,
+        "${list.len(h.posts)} standoff(s) keep at least ${n(want)} mm from the parts")
+
+// The board's hole is wider than the screw.
+fn screw_hole_fit(h: Housing) -> Check
+    var bad: [Str] = []
+    for q in h.posts
+        if q.hole < h.params.screw_d + 0.1 - EPS
+            list.push(bad, "the hole at ${q.ref} is ${n(q.hole)} mm for a ${n(h.params.screw_d)} mm screw")
+    verdict("screw-hole-fit",
+        "error",
+        bad,
+        "every mounting hole passes the ${n(h.params.screw_d)} mm screw")
+
+// Every standoff stands wholly on the board.
+fn post_on_board(h: Housing) -> Check
+    var bad: [Str] = []
+    for q in h.posts
+        let c = Pt { x: q.x, y: q.y }
+        if not kpcbgeom.inside(h.outline, c) or kpcbgeom.boundary_dist(h.outline, c) < h.params.standoff_d / 2.0 - EPS
+            list.push(bad, "the standoff at ${q.ref} overhangs the board's edge")
+    verdict("post-on-board", "error", bad, "every standoff stands on the board")
+
+// The lid closes over the tallest part with the headroom asked for.
+fn lid_headroom(h: Housing) -> Check
+    let room = h.z_split - (h.z_bt + h.top_max)
+    var bad: [Str] = []
+    if room < h.params.headroom_top - EPS
+        list.push(bad,
+            "the lid leaves ${n(room)} mm over a part ${n(h.top_max)} mm tall, not the ${n(h.params.headroom_top)} mm asked for")
+    verdict("lid-headroom",
+        "error",
+        bad,
+        "the lid leaves ${n(room)} mm over the tallest part, ${n(h.top_max)} mm")
+
+// The space under the board holds its tallest part with its headroom.
+fn bottom_headroom(h: Housing) -> Check
+    let room = h.h_st - h.bottom_max
+    var bad: [Str] = []
+    if room < h.params.headroom_bottom - EPS
+        list.push(bad,
+            "the standoffs leave ${n(room)} mm under a part ${n(h.bottom_max)} mm tall, not the ${n(h.params.headroom_bottom)} mm asked for")
+    verdict("bottom-headroom",
+        "error",
+        bad,
+        "the standoffs leave ${n(room)} mm under the tallest part, ${n(h.bottom_max)} mm")
+
+// Whether the corner of a box lies inside the wall's inner face: over the
+// board, or no farther outside its edge than the clearance.
+fn corner_in(h: Housing, x: Float, y: Float) -> Bool
+    let c = Pt { x: x, y: y }
+    kpcbgeom.inside(h.outline, c) or kpcbgeom.boundary_dist(h.outline, c) <= h.params.clear + EPS
+
+// Every part without an opening lies inside the wall.
+fn in_cavity(h: Housing) -> Check
+    var bad: [Str] = []
+    for k in h.blocks
+        if not k.opening
+            let ok = corner_in(h, k.x0, k.y0) and corner_in(h, k.x1, k.y0) and corner_in(h, k.x1, k.y1) and corner_in(h, k.x0, k.y1)
+            if not ok
+                list.push(bad, "${k.ref} reaches into the wall")
+    verdict("in-cavity", "error", bad, "every part without an opening is inside the wall")
+
+// A standard screw exists and its hole fits with a skin to spare.
+fn screw_fit(h: Housing) -> Check
+    var bad: [Str] = []
+    let skin = 2.0 * h.params.nozzle
+    if list.len(h.posts) > 0
+        if h.screw_len == 0.0
+            list.push(bad, "no standard screw is long enough for ${n(h.params.engage_min)} mm of thread")
+        else
+            let room = if h.params.lid == LidSnap
+                h.h_st + h.params.floor_t - skin
+            else
+                h.top_space + h.params.lid_t - skin
+            if h.pilot_len > room + EPS
+                list.push(bad,
+                    "the screw's hole is ${n(h.pilot_len)} mm deep and the ${if h.params.lid == LidSnap then "standoff" else "pillar"} leaves ${n(room)} mm above its skin")
+    verdict("screw-fit",
+        "error",
+        bad,
+        "an M${n(h.params.screw_d)} x ${n(h.screw_len)} screw fits, its hole ${n(h.pilot_len)} mm deep")
+
+// The board has a mounting hole to hold it by.
+fn mount_holes(h: Housing) -> Check
+    var bad: [Str] = []
+    if list.len(h.posts) == 0
+        list.push(bad,
+            "the board has no mounting hole of ${n(h.params.mount_min_drill)} mm or more: nothing holds it")
+    verdict("mount-holes", "error", bad, "${list.len(h.posts)} mounting hole(s)")
+
+// Whether a plate opening is over the centre of a block.
+fn covers(o: Opening, k: Block) -> Bool
+    let cx = (k.x0 + k.x1) / 2.0
+    let cy = (k.y0 + k.y1) / 2.0
+    if o.shape == "round"
+        math.hypot(cx - o.cx, cy - o.cy) <= o.w / 2.0
+    else
+        math.abs(cx - o.cx) <= o.w / 2.0 and math.abs(cy - o.cy) <= o.h / 2.0
+
+// Every connector has an opening or a place in one.
+fn connector_reach(h: Housing) -> Check
+    var bad: [Str] = []
+    for k in h.blocks
+        if k.kind == "connector" and not k.opening
+            let reached = list.any(h.openings, o => o.part != "both" and covers(o, k))
+            if not reached
+                list.push(bad, "${k.ref} faces no edge and no extra opening covers it")
+    verdict("connector-reach", "warning", bad, "every connector can be reached")
+
+// Every part has a height that is a fact.
+fn heights_known(h: Housing) -> Check
+    let unknown = list.filter(h.blocks, k => not k.known)
+    var bad: [Str] = []
+    if list.len(unknown) > 0
+        list.push(bad,
+            "${list.len(unknown)} part(s) have no known height and count as ${n(h.params.unknown_height)} mm: ${str.join(list.map(list.take(unknown, 8), k => k.ref), ", ")}")
+    verdict("heights-known", "warning", bad, "every part has a height")
+
+// Runs every check on the housing, in the order of the list in the
+// module's description.
+//
+// ```novo
+// use std.bytes
+// use kpcbread
+// use encmodel
+// use encparams
+// use encchecks
+//
+// fn main() [io]
+//     let src = bytes.from_str("(kicad_pcb (version 20241229) (gr_rect (start 0 0) (end 20 10) (layer Edge.Cuts)))")
+//     match kpcbread.read(src, "a.kicad_pcb")
+//         Err(e) => println(e.message())
+//         Ok(b)  =>
+//             let cs = encchecks.run(encmodel.build(b, encparams.defaults()))
+//             println("${list.len(cs)} checks, ${encchecks.passes(cs)}")   // 14 checks, false
+// ```
+pub fn run(h: Housing) -> [Check] []
+    [wall_min(h),
+        feature_min(h),
+        opening_in_wall(h),
+        opening_in_plate(h),
+        post_clear(h),
+        screw_hole_fit(h),
+        post_on_board(h),
+        lid_headroom(h),
+        bottom_headroom(h),
+        in_cavity(h),
+        screw_fit(h),
+        mount_holes(h),
+        connector_reach(h),
+        heights_known(h)]
+
+// Whether no check of severity `error` failed.
+pub fn passes(cs: [Check]) -> Bool []
+    list.all(cs, c => c.ok or c.severity != "error")
+
+// The checks that failed, warnings and errors.
+pub fn failing(cs: [Check]) -> [Check] []
+    list.filter(cs, c => not c.ok)
+
+// The checks as one line each: the verdict, the name and the detail.
+pub fn report(cs: [Check]) -> Str []
+    str.join(list.map(cs, c => "${if c.ok then "ok" else c.severity}  ${c.name}  ${c.detail}"), "\n")

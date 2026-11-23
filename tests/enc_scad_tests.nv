@@ -1,0 +1,210 @@
+// enc_scad_tests — the OpenSCAD text: golden files for three variants of
+// one board, the shared parameter block, and the subset of the language
+// the text keeps to.
+
+use std.test
+use std.fs
+use kpcbgeom
+use kpcbboard
+use kpcbread
+use encmodel
+use encparams
+use encscad
+
+// The parameters of the golden variant `v`.
+fn variant(v: Str) -> Params
+    var p = encparams.defaults()
+    p.name = v
+    if v == "usbc_snap"
+        p.lid = LidSnap
+    if v == "usbc_parts"
+        p.led = LedPipe
+        p.button = ButtonCap
+        p.extras = [encparams.lid_extra("vent", 115.0, 117.0, 6.0, 2.0),
+            encparams.floor_extra("drain", 110.0, 105.0, 4.0, 4.0),
+            encparams.side_extra("slot", 0, 10.0, 1.5, 6.0, 2.5)]
+    p
+
+// The housing of the golden variant `v`, from the board of the USB-C fixture.
+fn housing(v: Str) -> Housing [fs]
+    match fs.read_bytes("tests/fixtures/usbc_board.kicad_pcb")
+        None    => encmodel.build(stand_in(), variant(v))
+        Some(s) =>
+            match kpcbread.read(s, "usbc_board.kicad_pcb")
+                Ok(b)  => encmodel.build(b, variant(v))
+                Err(_) => encmodel.build(stand_in(), variant(v))
+
+// A board to build from when a fixture does not read, so that a failing
+// assertion follows and says so.
+fn stand_in() -> Board
+    Board { file: "",
+        version: 0,
+        thickness: 1.6,
+        outline: [kpcbgeom.pt(0.0, 0.0), kpcbgeom.pt(1.0, 0.0), kpcbgeom.pt(1.0, 1.0)],
+        cutouts: [],
+        area: 0.0,
+        box: kpcbgeom.rect(0.0, 0.0, 1.0, 1.0),
+        holes: [],
+        parts: [] }
+
+// The golden text of file `name` of variant `v`, or the empty string.
+fn golden(v: Str, name: Str) -> Str [fs]
+    fs.read("tests/golden/${v}/${name}") ?? ""
+
+// Whether every file of variant `v` is its golden file, byte for byte.
+fn matches_golden(v: Str, count: Int) -> Bool [fs]
+    let files = encscad.files(housing(v))
+    var same = list.len(files) == count
+    for f in files
+        if f.text != golden(v, f.name)
+            test.assert_eq(f.name, "a golden file that differs")
+            same = false
+    same
+
+@test
+fn test_the_screwed_housing_is_its_golden_text() [fs]
+    test.assert(matches_golden("usbc_screwed", 3))
+
+@test
+fn test_the_snap_housing_is_its_golden_text() [fs]
+    test.assert(matches_golden("usbc_snap", 3))
+
+@test
+fn test_the_housing_with_pipe_cap_and_extra_openings_is_its_golden_text() [fs]
+    test.assert(matches_golden("usbc_parts", 5))
+
+@test
+fn test_the_files_come_in_the_order_base_lid_parts_assembly() [fs]
+    let names = list.map(encscad.files(housing("usbc_parts")), f => f.name)
+    test.assert_eq(names, ["usbc_parts_base.scad",
+        "usbc_parts_lid.scad",
+        "usbc_parts_cap_SW1.scad",
+        "usbc_parts_pipe_D1.scad",
+        "usbc_parts_assembly.scad"])
+    test.assert_eq(encscad.part_name(housing("usbc_parts"), "base"), "usbc_parts_base.scad")
+
+@test
+fn test_the_same_inputs_give_byte_identical_text() [fs]
+    let a = encscad.files(housing("usbc_parts"))
+    let b = encscad.files(housing("usbc_parts"))
+    for i in 0..list.len(a)
+        test.assert_eq(a[i].text == b[i].text, true)
+        test.assert_eq(a[i].name, b[i].name)
+
+@test
+fn test_every_file_starts_with_the_same_parameter_block() [fs]
+    for v in ["usbc_screwed", "usbc_snap", "usbc_parts"]
+        let h = housing(v)
+        let block = str.join(encscad.parameter_lines(h), "\n")
+        test.assert(str.contains(block, "wall = 2.4;"))
+        test.assert(str.contains(block, "z_top = z_split + lid_t;"))
+        for f in encscad.files(h)
+            test.assert(str.contains(f.text, block))
+            test.assert(str.starts_with(f.text, "// "))
+
+@test
+fn test_the_first_lines_name_the_package_and_the_board_file() [fs]
+    let f = encscad.files(housing("usbc_snap"))[0]
+    let lines = str.lines(f.text)
+    test.assert_eq(lines[0], "// The base of the housing \"usbc_snap\", written by enclosure-nv 0.1.0")
+    test.assert_eq(lines[1], "// from the board file usbc_board.kicad_pcb.  Render with OpenSCAD.")
+
+@test
+fn test_numbers_are_rounded_to_a_thousandth_with_no_exponent_and_no_negative_zero()
+    test.assert_eq(encscad.num(2.4), "2.4")
+    test.assert_eq(encscad.num(30.0), "30")
+    test.assert_eq(encscad.num(0.30000000000000004), "0.3")
+    test.assert_eq(encscad.num(-0.0004), "0")
+    test.assert_eq(encscad.num(0.00001), "0")
+    test.assert_eq(encscad.num(-12.3456), "-12.346")
+    test.assert_eq(encscad.num(0.001), "0.001")
+
+// The names called as modules or functions in `text`: the identifier in
+// front of every opening parenthesis that is not a keyword.
+fn calls_in(text: Str) -> [Str]
+    var out: [Str] = []
+    let n = str.len(text)
+    for i in 0..n
+        if str.byte_at_or(text, i, 0) == '('
+            var j = i
+            while j > 0 and is_ident(str.byte_at_or(text, j - 1, 0))
+                j -= 1
+            if j < i
+                list.push(out, str.slice(text, j, i))
+    out
+
+// Whether a byte can be part of an OpenSCAD identifier.
+fn is_ident(b: Int) -> Bool
+    b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z' or b >= '0' and b <= '9' or b == '_'
+
+@test
+fn test_the_text_calls_only_the_subset_it_lists() [fs]
+    let allowed = ["polygon",
+        "linear_extrude",
+        "offset",
+        "difference",
+        "union",
+        "translate",
+        "rotate",
+        "cube",
+        "cylinder",
+        "color",
+        "if",
+        "outline",
+        "base",
+        "lid",
+        "board",
+        "board_outline",
+        "parts",
+        "pipe_D1",
+        "cap_SW1"]
+    for v in ["usbc_screwed", "usbc_snap", "usbc_parts"]
+        for f in encscad.files(housing(v))
+            for c in calls_in(f.text)
+                if not list.contains(allowed, c)
+                    test.assert_eq(c, "a call in the subset")
+
+// The text without its comments.
+fn code_of(text: Str) -> Str
+    str.join(list.map(str.lines(text), l => str.split(l, "//")[0]), "\n")
+
+@test
+fn test_the_text_has_no_construct_outside_the_subset() [fs]
+    let banned = ["function",
+        "for (",
+        "for(",
+        "import",
+        "include <",
+        "hull",
+        "minkowski",
+        "text(",
+        "let(",
+        "each",
+        "sphere",
+        "scale(",
+        "mirror(",
+        "resize",
+        "multmatrix",
+        "children",
+        "render",
+        "projection",
+        "surface",
+        "rotate_extrude",
+        "intersection"]
+    for f in encscad.files(housing("usbc_parts"))
+        for word in banned
+            if str.contains(code_of(f.text), word)
+                test.assert_eq(word, "absent from ${f.name}")
+
+@test
+fn test_an_edit_of_the_wall_in_the_parameters_moves_every_level_through_the_text() [fs]
+    let f = encscad.files(housing("usbc_snap"))[0]
+    test.assert(str.contains(f.text, "z_bb = floor_t + standoff_h;"))
+    test.assert(str.contains(f.text, "offset(delta = clear + wall) outline();"))
+    test.assert(str.contains(f.text, "translate([0, 8.6, z_bt + (-0.4)])"))
+
+@test
+fn test_the_lid_lies_plate_down_when_print_flip_is_set_and_stays_in_place_otherwise() [fs]
+    let lid = encscad.files(housing("usbc_screwed"))[1]
+    test.assert(str.contains(lid.text, "print_flip = false;"))
+    test.assert(str.contains(lid.text, "translate([0, 20, z_top]) rotate([180, 0, 0]) lid();"))

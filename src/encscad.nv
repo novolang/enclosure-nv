@@ -1,0 +1,335 @@
+// encscad — the housing as OpenSCAD text.
+//
+// `files` answers one file per part and one for the assembly.  The text
+// keeps to a small subset of the language: modules without parameters,
+// numeric variables and their arithmetic, `polygon`, `linear_extrude`,
+// `offset(delta = ...)`, `difference`, `union`, `translate`, `rotate`,
+// `cube`, `cylinder`, `color` and `use <file>`, with one `if` on a
+// boolean variable.  Every file starts with the same block of
+// parameters, in millimetres, so that a person can adjust the housing in
+// the text.  The levels along z, and the openings' heights, are written
+// as sums of those parameters, so a change of a wall or a plate moves
+// them with it.  The positions of standoffs, openings and parts are
+// numbers: a change of the board needs a new text.
+//
+// The parts are written in their assembled positions.  The lid carries a
+// boolean `print_flip`: set it and the lid lies plate down on the bed.
+
+use encmodel
+use encparams
+
+// A file of text with its name.
+pub struct ScadFile
+    name: Str
+    text: Str
+
+// A number as OpenSCAD text: rounded to a thousandth, with no exponent
+// and no negative zero.
+pub fn num(x: Float) -> Str []
+    let r = math.round(x * 1000.0) / 1000.0
+    str.from_float((if r == 0.0 then 0.0 else r))
+
+// The version of this package, written into the first line of every file.
+pub const VERSION = "0.1.0"
+
+// The side count argument of every cylinder.
+const FN = "\$fn = 32"
+
+// The lines of `lines` joined with line feeds, with one at the end.
+fn text_of(lines: [Str]) -> Str
+    str.join(lines, "\n") + "\n"
+
+// The block of parameters that heads every file.
+//
+// The first lines are the values a person adjusts.  `standoff_h` and
+// `top_space` are computed from the board and may be replaced by a
+// number of the person's choosing.
+pub fn parameter_lines(h: Housing) -> [Str] []
+    let p = h.params
+    [
+        "// Parameters, in millimetres.  The same block heads every file of this housing:",
+        "// when a value is changed, change it in each file.",
+        "wall = ${num(p.wall)};",
+        "floor_t = ${num(p.floor_t)};",
+        "lid_t = ${num(p.lid_t)};",
+        "clear = ${num(p.clear)};  // the board's edge to the inside of the wall",
+        "standoff_d = ${num(p.standoff_d)};",
+        "screw_d = ${num(p.screw_d)};",
+        "pilot_d = ${num(p.pilot_d)};",
+        "head_d = ${num(p.head_d)};",
+        "head_h = ${num(p.head_h)};",
+        "lip_h = ${num(p.lip_h)};  // the height of the step the lid sits on",
+        "lid_gap = ${num(p.lid_gap)};",
+        "snap_depth = ${num(p.snap_depth)};",
+        "snap_h = ${num(p.snap_h)};",
+        "led_d = ${num(p.led_d)};",
+        "button_d = ${num(p.button_d)};",
+        "board_t = ${num(h.board_t)};",
+        "standoff_h = ${num(h.h_st)};  // the space under the board",
+        "top_space = ${num(h.top_space)};  // the space above the board",
+        "pilot_len = ${num(h.pilot_len)};  // the depth of the screw's hole",
+        "print_flip = false;  // true lays the lid plate down",
+        "",
+        "// Levels along z.",
+        "z_bb = floor_t + standoff_h;",
+        "z_bt = z_bb + board_t;",
+        "z_split = z_bt + top_space;",
+        "z_step = z_split - lip_h;",
+        "z_top = z_split + lid_t;",
+        "z_skirt = z_step + lid_gap;",
+        "a_in = wall / 2;",
+        "screw_clear = screw_d + 0.3;"]
+
+// The first lines of a file: what wrote it, from what, and the parameters.
+fn header(h: Housing, what: Str) -> [Str]
+    var out: [Str] = [
+        "// ${what} of the housing \"${h.params.name}\", written by enclosure-nv ${VERSION}",
+        "// from the board file ${h.source}.  Render with OpenSCAD."]
+    for l in parameter_lines(h)
+        list.push(out, l)
+    out
+
+// The module `name`, which draws the board's outline as a polygon.  The
+// parts call theirs `outline` and the assembly `board_outline`, so that a
+// module `use`d from a part cannot shadow the assembly's own.
+fn outline_lines(h: Housing, name: Str) -> [Str]
+    let pts = str.join(list.map(h.outline, q => "[${num(q.x)}, ${num(q.y)}]"), ", ")
+    ["", "module ${name}() {", "  polygon(points = [${pts}]);", "}"]
+
+// The cut-outs of the board as polygons, one per line.
+fn cutout_lines(h: Housing) -> [Str]
+    var out: [Str] = []
+    var at = 0
+    for n in h.cut_sizes
+        let pts = str.join(list.map(list.slice(h.cut_pts, at, at + n), q => "[${num(q.x)}, ${num(q.y)}]"), ", ")
+        list.push(out, "    polygon(points = [${pts}]);")
+        at += n
+    out
+
+// The text that cuts the opening `o` out of a solid, one line.
+//
+// A wall opening is a box laid along the wall at the opening's angle,
+// from one millimetre inside the board's edge to one millimetre outside
+// the wall.  A plate opening is a box or a cylinder through the plate
+// with a millimetre to spare at both faces.
+fn cut_line(h: Housing, o: Opening) -> Str
+    if o.face == "lid" or o.face == "floor"
+        let z = if o.face == "lid"
+            "z_split - 1"
+        else
+            "-1"
+        let t = if o.face == "lid"
+            "lid_t + 2"
+        else
+            "floor_t + 2"
+        if o.shape == "round"
+            "    translate([${num(o.cx)}, ${num(o.cy)}, ${z}]) cylinder(h = ${t}, d = ${num(o.w)}, ${FN});"
+        else
+            "    translate([${num(o.cx - o.w / 2.0)}, ${num(o.cy - o.h / 2.0)}, ${z}]) cube([${num(o.w)}, ${num(o.h)}, ${t}]);"
+    else
+        "    translate([${num(o.cx)}, ${num(o.cy)}, z_bt + (${num(o.z0 - h.z_bt)})]) rotate([0, 0, ${num(o.ang)}]) translate([-1, ${num(-o.w / 2.0)}, 0]) cube([clear + wall + 2, ${num(o.w)}, ${num(o.z1 - o.z0)}]);"
+
+// The cut lines of the openings that belong to `part` (`base` or `lid`).
+fn cut_lines(h: Housing, part: Str) -> [Str]
+    var out: [Str] = []
+    for o in h.openings
+        if o.part == part or o.part == "both"
+            list.push(out, cut_line(h, o))
+    out
+
+// A cylinder standing on the plane z = `z0` as a line of text.
+fn cyl_line(x: Float, y: Float, z0: Str, height: Str, d: Str) -> Str
+    "    translate([${num(x)}, ${num(y)}, ${z0}]) cylinder(h = ${height}, d = ${d}, ${FN});"
+
+// The text of the base.
+fn base_text(h: Housing) -> Str
+    var lines = header(h, "The base")
+    for l in outline_lines(h, "outline")
+        list.push(lines, l)
+    for l in [
+        "",
+        "module base() {",
+        "  difference() {",
+        "    union() {",
+        "      difference() {",
+        "        linear_extrude(height = z_split) offset(delta = clear + wall) outline();",
+        "        translate([0, 0, floor_t]) linear_extrude(height = z_split) offset(delta = clear) outline();",
+        "        translate([0, 0, z_step]) linear_extrude(height = z_split) difference() {",
+        "          offset(delta = clear + wall + 1) outline();",
+        "          offset(delta = clear + a_in) outline();",
+        "        }"]
+        list.push(lines, l)
+    if h.params.lid == LidSnap
+        for l in [
+            "        // the groove the lid's bead clicks into",
+            "        translate([0, 0, z_skirt - 0.1]) linear_extrude(height = snap_h + 0.2) difference() {",
+            "          offset(delta = clear + a_in + 0.01) outline();",
+            "          offset(delta = clear + a_in - snap_depth) outline();",
+            "        }"]
+            list.push(lines, l)
+    list.push(lines, "      }")
+    list.push(lines, "      // the standoffs")
+    for q in h.posts
+        list.push(lines, "  " + cyl_line(q.x, q.y, "floor_t / 2", "z_bb - floor_t / 2", "standoff_d"))
+    list.push(lines, "    }")
+    if h.params.lid == LidSnap
+        list.push(lines, "    // the screw holes, blind")
+        for q in h.posts
+            list.push(lines, cyl_line(q.x, q.y, "z_bb - pilot_len", "pilot_len + 1", "pilot_d"))
+    else
+        list.push(lines,
+            "    // the screw holes, through the standoff and the floor, with a recess for the head")
+        for q in h.posts
+            list.push(lines, cyl_line(q.x, q.y, "-1", "z_bb + 2", "screw_clear"))
+            list.push(lines, cyl_line(q.x, q.y, "-1", "head_h + 1", "head_d + 0.4"))
+    let cuts = cut_lines(h, "base")
+    if list.len(cuts) > 0
+        list.push(lines, "    // the openings")
+        for c in cuts
+            list.push(lines, c)
+    list.push(lines, "  }")
+    list.push(lines, "}")
+    list.push(lines, "")
+    list.push(lines, "base();")
+    text_of(lines)
+
+// The text of the lid.
+fn lid_text(h: Housing) -> Str
+    var lines = header(h, "The lid")
+    for l in outline_lines(h, "outline")
+        list.push(lines, l)
+    for l in [
+        "",
+        "module lid() {",
+        "  difference() {",
+        "    union() {",
+        "      // the plate",
+        "      translate([0, 0, z_split]) linear_extrude(height = lid_t) offset(delta = clear + wall) outline();",
+        "      // the skirt that takes the place of the outer half of the wall",
+        "      translate([0, 0, z_skirt]) linear_extrude(height = z_split - z_skirt + 0.2) difference() {",
+        "        offset(delta = clear + wall) outline();",
+        "        offset(delta = clear + a_in + lid_gap) outline();",
+        "      }"]
+        list.push(lines, l)
+    if h.params.lid == LidSnap
+        for l in [
+            "      // the bead that clicks into the wall's groove",
+            "      translate([0, 0, z_skirt]) linear_extrude(height = snap_h) difference() {",
+            "        offset(delta = clear + a_in + lid_gap + 0.2) outline();",
+            "        offset(delta = clear + a_in + lid_gap - snap_depth) outline();",
+            "      }"]
+            list.push(lines, l)
+    else
+        list.push(lines, "      // the pillars the screws turn into")
+        for q in h.posts
+            list.push(lines, "  " + cyl_line(q.x, q.y, "z_bt", "z_split - z_bt + 0.2", "standoff_d"))
+    list.push(lines, "    }")
+    if h.params.lid == LidScrewed
+        list.push(lines, "    // the screws' holes")
+        for q in h.posts
+            list.push(lines, cyl_line(q.x, q.y, "z_bt - 1", "pilot_len + 1", "pilot_d"))
+    let cuts = cut_lines(h, "lid")
+    if list.len(cuts) > 0
+        list.push(lines, "    // the openings")
+        for c in cuts
+            list.push(lines, c)
+    list.push(lines, "  }")
+    list.push(lines, "}")
+    list.push(lines, "")
+    list.push(lines, "if (print_flip) {")
+    list.push(lines, "  translate([0, ${num(h.depth)}, z_top]) rotate([180, 0, 0]) lid();")
+    list.push(lines, "} else {")
+    list.push(lines, "  lid();")
+    list.push(lines, "}")
+    text_of(lines)
+
+// The name of a part file for part `what` of reference `ref`.
+pub fn part_name(h: Housing, what: Str) -> Str []
+    "${h.params.name}_${what}.scad"
+
+// The text of a light pipe or a button cap.
+fn cap_text(h: Housing, c: Cap) -> Str
+    var lines = header(h, "The ${c.kind} ${c.ref}")
+    let z0 = "z_bt + (${num(c.z0 - h.z_bt)})"
+    let z1 = if c.kind == "pipe"
+        "z_top"
+    else
+        "z_top + 0.4"
+    let d = if c.kind == "pipe"
+        "led_d"
+    else
+        "button_d"
+    for l in [
+        "",
+        "module ${c.kind}_${c.ref}() {",
+        "  union() {",
+        cyl_line(c.x, c.y, z0, "${z1} - (${z0})", d),
+        cyl_line(c.x, c.y, "z_split - 0.6", "0.6", "${d} + 2"),
+        "  }",
+        "}",
+        "",
+        "${c.kind}_${c.ref}();"]
+        list.push(lines, l)
+    text_of(lines)
+
+// The assembly: the parts in place, the board and its parts as boxes.
+fn assembly_text(h: Housing) -> Str
+    var lines = header(h, "The assembly")
+    list.push(lines, "")
+    list.push(lines, "use <${part_name(h, "base")}>")
+    list.push(lines, "use <${part_name(h, "lid")}>")
+    for c in h.caps
+        list.push(lines, "use <${part_name(h, "${c.kind}_${c.ref}")}>")
+    for l in outline_lines(h, "board_outline")
+        list.push(lines, l)
+    list.push(lines, "")
+    list.push(lines, "module board() {")
+    list.push(lines,
+        "  color([0.1, 0.55, 0.25, 0.8]) translate([0, 0, z_bb]) linear_extrude(height = board_t) difference() {")
+    list.push(lines, "    board_outline();")
+    for l in cutout_lines(h)
+        list.push(lines, l)
+    list.push(lines, "  }")
+    list.push(lines, "}")
+    list.push(lines, "")
+    list.push(lines, "module parts() {")
+    list.push(lines, "  color([0.75, 0.75, 0.75, 0.9]) {")
+    for k in h.blocks
+        list.push(lines,
+            "    translate([${num(k.x0)}, ${num(k.y0)}, ${num(k.z0)}]) cube([${num(k.x1 - k.x0)}, ${num(k.y1 - k.y0)}, ${num(k.z1 - k.z0)}]);  // ${k.ref}")
+    list.push(lines, "  }")
+    list.push(lines, "}")
+    list.push(lines, "")
+    list.push(lines, "base();")
+    list.push(lines, "lid();")
+    for c in h.caps
+        list.push(lines, "${c.kind}_${c.ref}();")
+    list.push(lines, "board();")
+    list.push(lines, "parts();")
+    text_of(lines)
+
+// The files of a housing: the base, the lid, one file for each light
+// pipe and button cap, and the assembly, in that order.
+//
+// ```novo
+// use std.bytes
+// use kpcbread
+// use encmodel
+// use encparams
+// use encscad
+//
+// fn main() [io]
+//     let src = bytes.from_str("(kicad_pcb (version 20241229) (gr_rect (start 0 0) (end 20 10) (layer Edge.Cuts)))")
+//     match kpcbread.read(src, "a.kicad_pcb")
+//         Err(e) => println(e.message())
+//         Ok(b)  =>
+//             let files = encscad.files(encmodel.build(b, encparams.defaults()))
+//             println(files[0].name)   // housing_base.scad
+// ```
+pub fn files(h: Housing) -> [ScadFile] []
+    var out: [ScadFile] = [ScadFile { name: part_name(h, "base"), text: base_text(h) },
+        ScadFile { name: part_name(h, "lid"), text: lid_text(h) }]
+    for c in h.caps
+        list.push(out, ScadFile { name: part_name(h, "${c.kind}_${c.ref}"), text: cap_text(h, c) })
+    list.push(out, ScadFile { name: part_name(h, "assembly"), text: assembly_text(h) })
+    out

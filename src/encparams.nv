@@ -1,0 +1,183 @@
+// encparams — what a person chooses about a housing.
+//
+// Every length is in millimetres.  A `Params` starts from `defaults()`,
+// which are the numbers of a 0.4 mm nozzle and an M2.5 screw, and a
+// caller changes the fields it cares about:
+//
+// ```novo
+// use encparams
+//
+// fn main() [io]
+//     var p = encparams.defaults()
+//     p.wall = 3.2
+//     p.lid = LidSnap
+//     println("${p.wall}")   // 3.2
+// ```
+//
+// A field whose default is zero is computed from the board when it is
+// zero, and is used as given when it is not.
+
+// How the lid is held.
+//
+// `LidScrewed` runs one screw from under the floor through each
+// mounting hole into a pillar of the lid, so the screws hold the lid and
+// the board together.  `LidSnap` holds the lid with a bead on its skirt
+// that clicks into a groove of the wall, and the board is screwed to its
+// standoffs from above.
+pub enum LidStyle
+    LidScrewed
+    LidSnap
+
+// What is made for an LED that lights through the lid or the floor.
+//
+// `LedNone` leaves the lid closed over it, `LedWindow` cuts a hole, and
+// `LedPipe` cuts a hole and adds a printed light pipe that stands on the
+// LED's height and ends flush with the lid.  An LED on the back of the
+// board gets a window in the floor in both of the last two modes.
+pub enum LedMode
+    LedNone
+    LedWindow
+    LedPipe
+
+// What is made for a button that is pressed through the lid or the
+// floor.
+//
+// `ButtonNone` leaves it covered, `ButtonHole` cuts a hole for a finger
+// or a pin, and `ButtonCap` cuts a hole and adds a printed cap that
+// stands above the button and projects from the lid.  A button on the
+// back of the board gets a hole in the floor in both of the last two
+// modes.
+pub enum ButtonMode
+    ButtonNone
+    ButtonHole
+    ButtonCap
+
+// An opening the board file does not imply.
+//
+// `face` is `lid` or `floor` for a hole through the plate, or `side` for
+// a hole through the wall.  A plate hole is the box of `w` by `h`
+// centred on the board position (x, y), in the coordinates of the board
+// file.  A side hole is on the outline segment `seg`, `x` millimetres
+// from the segment's first point in the file's order, `w` wide along the
+// wall and `h` high, centred `z` millimetres above the board's front
+// surface.
+pub struct Extra
+    name: Str
+    face: Str
+    x: Float
+    y: Float
+    w: Float
+    h: Float
+    seg: Int
+    z: Float
+
+// The parameters of a housing.
+//
+// `wall` is the thickness of the side wall.  `floor_t` and `lid_t` are
+// the plate thicknesses.  `clear` is the gap between the board's edge
+// and the inside of the wall.  `standoff_d` is the diameter of a
+// standoff and of a lid pillar, `screw_d` the thread diameter,
+// `pilot_d` the diameter of the hole a screw cuts its thread in, `head_d`
+// and `head_h` the screw head's diameter and height.  `engage_min` is
+// the least depth of thread in plastic.
+//
+// `standoff_h` is the space under the board, and `top_space` the space
+// above it: zero means the tallest part on that side plus its headroom,
+// with `standoff_min` as the least space under the board.
+// `opening_margin` is added on every side of an edge opening.
+// `mount_min_drill` is the smallest hole a screw is taken to use, and
+// `post_clear` the distance a standoff or pillar keeps from a part.
+// `lip_h` is the height of the step in the wall where the lid sits,
+// `lid_gap` the clearance between the lid's skirt and the wall,
+// `snap_depth` and `snap_h` the size of the bead and the groove.
+// `led_d` and `button_d` are the diameters of a light pipe and of a
+// button cap.  `unknown_height` stands for a part whose height is not
+// known.  `nozzle` is the nozzle diameter and `min_feature` the
+// smallest opening or pin a print is asked to hold.  `extras` are the
+// openings the board file does not imply, and `name` begins the name of
+// every file.
+pub struct Params
+    var name: Str
+    var wall: Float
+    var floor_t: Float
+    var lid_t: Float
+    var lid: LidStyle
+    var clear: Float
+    var standoff_d: Float
+    var screw_d: Float
+    var pilot_d: Float
+    var head_d: Float
+    var head_h: Float
+    var engage_min: Float
+    var standoff_h: Float
+    var standoff_min: Float
+    var top_space: Float
+    var headroom_top: Float
+    var headroom_bottom: Float
+    var opening_margin: Float
+    var mount_min_drill: Float
+    var post_clear: Float
+    var lip_h: Float
+    var lid_gap: Float
+    var snap_depth: Float
+    var snap_h: Float
+    var led: LedMode
+    var led_d: Float
+    var button: ButtonMode
+    var button_d: Float
+    var unknown_height: Float
+    var nozzle: Float
+    var min_feature: Float
+    var extras: [Extra]
+
+// The defaults: a 2.4 mm wall of six perimeters, plates of 2.4 and
+// 1.6 mm, a screwed lid, 0.5 mm between the board and the wall, M2.5
+// screws in 6 mm standoffs, 1 mm of headroom on each side of the board,
+// windows for LEDs and holes for buttons, and a 0.4 mm nozzle.
+pub fn defaults() -> Params []
+    Params { name: "housing",
+        wall: 2.4,
+        floor_t: 2.4,
+        lid_t: 1.6,
+        lid: LidScrewed,
+        clear: 0.5,
+        standoff_d: 6.0,
+        screw_d: 2.5,
+        pilot_d: 2.1,
+        head_d: 5.0,
+        head_h: 1.6,
+        engage_min: 3.0,
+        standoff_h: 0.0,
+        standoff_min: 3.0,
+        top_space: 0.0,
+        headroom_top: 1.0,
+        headroom_bottom: 1.0,
+        opening_margin: 0.4,
+        mount_min_drill: 2.0,
+        post_clear: 0.4,
+        lip_h: 3.0,
+        lid_gap: 0.2,
+        snap_depth: 0.4,
+        snap_h: 0.8,
+        led: LedWindow,
+        led_d: 3.0,
+        button: ButtonHole,
+        button_d: 3.0,
+        unknown_height: 1.0,
+        nozzle: 0.4,
+        min_feature: 1.0,
+        extras: [] }
+
+// An opening through the lid, centred on the board position (x, y).
+pub fn lid_extra(name: Str, x: Float, y: Float, w: Float, h: Float) -> Extra []
+    Extra { name: name, face: "lid", x: x, y: y, w: w, h: h, seg: -1, z: 0.0 }
+
+// An opening through the floor, centred on the board position (x, y).
+pub fn floor_extra(name: Str, x: Float, y: Float, w: Float, h: Float) -> Extra []
+    Extra { name: name, face: "floor", x: x, y: y, w: w, h: h, seg: -1, z: 0.0 }
+
+// An opening through the wall on outline segment `seg`, `along`
+// millimetres from the segment's first point, centred `z` millimetres
+// above the board's front surface.
+pub fn side_extra(name: Str, seg: Int, along: Float, z: Float, w: Float, h: Float) -> Extra []
+    Extra { name: name, face: "side", x: along, y: 0.0, w: w, h: h, seg: seg, z: z }

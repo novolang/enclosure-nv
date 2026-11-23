@@ -1,0 +1,492 @@
+// enc_model_tests — the housing's model: its levels, standoffs,
+// openings, light pipes and caps, on the fixtures and on boards written
+// inline.
+
+use std.test
+use std.bytes
+use std.fs
+use kpcbgeom
+use kpcbboard
+use kpcbread
+use encgeom
+use encmodel
+use encparams
+
+// A board of `w` by `h` from (100, 100), with `body` after the outline.
+fn pcb(w: Float, h: Float, body: Str) -> Str
+    "(kicad_pcb\n  (version 20241229)\n  (general (thickness 1.6))\n  (gr_rect (start 100 100) (end ${100.0 + w} ${100.0 + h}) (layer \"Edge.Cuts\"))\n" + body + ")\n"
+
+// A non-plated mounting hole of drill `d` at (x, y).
+fn hole(ref: Str, x: Float, y: Float, d: Float) -> Str
+    "  (footprint \"MountingHole:MountingHole_${d}mm\" (layer \"F.Cu\") (at ${x} ${y})\n    (property \"Reference\" \"${ref}\" (at 0 0 0))\n    (pad \"\" np_thru_hole circle (at 0 0) (size ${d} ${d}) (drill ${d}) (layers \"*.Cu\"))\n  )\n"
+
+// A part with a courtyard of `hw` by `hh` either side of its origin.
+fn comp(ref: Str, lib: Str, x: Float, y: Float, hw: Float, hh: Float, layer: Str, extra: Str) -> Str
+    let court = if layer == "B.Cu"
+        "B.CrtYd"
+    else
+        "F.CrtYd"
+    "  (footprint \"${lib}\" (layer \"${layer}\") (at ${x} ${y})\n    (property \"Reference\" \"${ref}\" (at 0 0 0))\n" + extra + "    (fp_rect (start -${hw} -${hh}) (end ${hw} ${hh}) (stroke (width 0.05) (type solid)) (fill none) (layer \"${court}\"))\n  )\n"
+
+// The board of `text`, or a stand-in board after a failed assertion.
+fn board_of(text: Str) -> Board
+    match kpcbread.read(bytes.from_str(text), "t.kicad_pcb")
+        Ok(b)  => b
+        Err(e) =>
+            test.assert_eq(e.message(), "")
+            Board { file: "",
+                version: 0,
+                thickness: 1.6,
+                outline: [kpcbgeom.pt(0.0, 0.0), kpcbgeom.pt(1.0, 0.0), kpcbgeom.pt(1.0, 1.0)],
+                cutouts: [],
+                area: 0.0,
+                box: kpcbgeom.rect(0.0, 0.0, 1.0, 1.0),
+                holes: [],
+                parts: [] }
+
+// The housing of the board `text` with parameters `p`.
+fn housing_of(text: Str, p: Params) -> Housing
+    encmodel.build(board_of(text), p)
+
+// The housing of the fixture `name` with parameters `p`.
+fn fixture(name: Str, p: Params) -> Housing [fs]
+    match fs.read_bytes("tests/fixtures/${name}.kicad_pcb")
+        None    => housing_of(pcb(10.0, 10.0, ""), p)
+        Some(s) =>
+            match kpcbread.read(s, name)
+                Ok(b)  => encmodel.build(b, p)
+                Err(_) => housing_of(pcb(10.0, 10.0, ""), p)
+
+// The opening named `name`, or a stand-in.
+fn opening(h: Housing, name: Str) -> Opening
+    match list.find(h.openings, o => o.name == name)
+        Some(o) => o
+        None    => Opening { name: "missing ${name}",
+            ref: "",
+            face: "",
+            shape: "",
+            cx: 0.0,
+            cy: 0.0,
+            ang: 0.0,
+            w: 0.0,
+            h: 0.0,
+            z0: 0.0,
+            z1: 0.0,
+            seg: -1,
+            along: 0.0,
+            part: "" }
+
+// The pipe or cap of the part `ref`, or a stand-in.
+fn cap_of(h: Housing, ref: Str) -> Cap
+    match list.find(h.caps, c => c.ref == ref)
+        Some(c) => c
+        None    => Cap { ref: "missing ${ref}",
+            kind: "",
+            x: 0.0,
+            y: 0.0,
+            stem_d: 0.0,
+            z0: 0.0,
+            z1: 0.0,
+            flange_d: 0.0,
+            fz0: 0.0,
+            fz1: 0.0 }
+
+// ── The levels ──────────────────────────────────────────────────────
+
+@test
+fn test_the_levels_stack_from_the_floor_to_the_lid_on_the_usb_board() [fs]
+    let h = fixture("usbc_board", encparams.defaults())
+    // 3.3 mm connector: the top space is 3.3 + 1.0.  The 0.8 mm capacitor on the back
+    // needs 1.8, so the standoffs take the minimum of 3.
+    test.assert_approx(h.top_max, 3.3, 0.0000001)
+    test.assert_approx(h.bottom_max, 0.8, 0.0000001)
+    test.assert_eq(h.h_st, 3.0)
+    test.assert_approx(h.top_space, 4.3, 0.0000001)
+    test.assert_approx(h.z_bb, 5.4, 0.0000001)
+    test.assert_approx(h.z_bt, 7.0, 0.0000001)
+    test.assert_approx(h.z_split, 11.3, 0.0000001)
+    test.assert_approx(h.z_step, 8.3, 0.0000001)
+    test.assert_approx(h.z_top, 12.9, 0.0000001)
+    test.assert_approx(h.z_skirt, 8.5, 0.0000001)
+
+@test
+fn test_a_standoff_height_or_top_space_given_is_used_and_not_computed() [fs]
+    var p = encparams.defaults()
+    p.standoff_h = 5.0
+    p.top_space = 6.0
+    let h = fixture("usbc_board", p)
+    test.assert_eq(h.h_st, 5.0)
+    test.assert_eq(h.top_space, 6.0)
+    test.assert_approx(h.z_split, 2.4 + 5.0 + 1.6 + 6.0, 0.0000001)
+
+@test
+fn test_a_tall_part_on_the_back_raises_the_standoffs()
+    let text = pcb(30.0, 20.0, hole("H1", 104.0, 104.0, 3.2) + comp("C9",
+        "Capacitor_THT:CP_Radial_D8.0mm",
+        115.0,
+        110.0,
+        4.0,
+        4.0,
+        "B.Cu",
+        "    (property \"Height\" \"6.5\" (at 0 0 0))\n"))
+    let h = housing_of(text, encparams.defaults())
+    test.assert_eq(h.bottom_max, 6.5)
+    test.assert_eq(h.h_st, 7.5)
+
+@test
+fn test_a_board_with_no_parts_gets_the_headroom_alone_and_the_minimum_standoff()
+    let h = housing_of(pcb(20.0, 10.0, ""), encparams.defaults())
+    test.assert_eq(h.top_max, 0.0)
+    test.assert_eq(h.h_st, 3.0)
+    test.assert_eq(h.top_space, 1.0)
+    test.assert_approx(h.z_top, 2.4 + 3.0 + 1.6 + 1.0 + 1.6, 0.0000001)
+
+@test
+fn test_a_part_of_unknown_height_stands_at_the_parameters_stand_in()
+    let text = pcb(30.0, 20.0, comp("U1", "Custom:Thing", 115.0, 110.0, 3.0, 3.0, "F.Cu", ""))
+    var p = encparams.defaults()
+    p.unknown_height = 2.5
+    let h = housing_of(text, p)
+    test.assert_eq(h.top_max, 2.5)
+    test.assert_eq(h.blocks[0].known, false)
+    test.assert_eq(h.blocks[0].z1 - h.blocks[0].z0, 2.5)
+
+// ── The frame ───────────────────────────────────────────────────────
+
+@test
+fn test_the_outline_is_shifted_flipped_and_counter_clockwise() [fs]
+    let h = fixture("usbc_board", encparams.defaults())
+    test.assert_eq(list.len(h.outline), 4)
+    test.assert_eq(h.width, 30.0)
+    test.assert_eq(h.depth, 20.0)
+    test.assert_eq(kpcbgeom.signed_area(h.outline), 600.0)
+    let box = kpcbgeom.bounds(h.outline)
+    test.assert_eq(box.x0, 0.0)
+    test.assert_eq(box.y0, 0.0)
+    test.assert_eq(box.x1, 30.0)
+    test.assert_eq(box.y1, 20.0)
+
+@test
+fn test_standoffs_stand_on_the_mounting_holes_to_a_hundredth_of_a_millimetre() [fs]
+    let h = fixture("usbc_board", encparams.defaults())
+    // The holes of the file are (126.5, 103.5) and (126.5, 116.5); y is flipped about 120.
+    test.assert_eq(list.len(h.posts), 2)
+    test.assert_approx(h.posts[0].x, 26.5, 0.01)
+    test.assert_approx(h.posts[0].y, 16.5, 0.01)
+    test.assert_approx(h.posts[1].x, 26.5, 0.01)
+    test.assert_approx(h.posts[1].y, 3.5, 0.01)
+    test.assert_eq(h.posts[0].ref, "H1")
+    test.assert_eq(h.posts[0].hole, 3.2)
+
+@test
+fn test_a_locating_pin_is_no_standoff_and_a_larger_minimum_drops_the_small_holes() [fs]
+    let a = fixture("usbc_board", encparams.defaults())
+    test.assert_eq(list.len(a.posts), 2)
+    var p = encparams.defaults()
+    p.mount_min_drill = 0.5
+    let b = fixture("usbc_board", p)
+    test.assert_eq(list.len(b.posts), 3)
+
+// ── Wall openings ───────────────────────────────────────────────────
+
+@test
+fn test_a_connector_on_the_left_edge_opens_the_left_wall_around_its_courtyard() [fs]
+    let h = fixture("usbc_board", encparams.defaults())
+    let o = opening(h, "J1")
+    test.assert_eq(o.face, "left")
+    test.assert_eq(o.part, "both")
+    test.assert_eq(o.shape, "box")
+    test.assert_approx(o.ang, 180.0, 0.0000001)
+    // The courtyard runs from y = 108.3 to 114.5 in the file, which is
+    // 8.5 to 11.7 in the housing's frame, so 6.2 long, and 7.0 with the margin.
+    test.assert_approx(o.w, 7.0, 0.0000001)
+    test.assert_approx(o.cx, 0.0, 0.0000001)
+    test.assert_approx(o.cy, 8.6, 0.0000001)
+    // The connector is 3.3 mm tall on the front: the opening runs from
+    // 0.4 below the board's surface to 0.4 above the connector.
+    test.assert_approx(o.z0, 7.0 - 0.4, 0.0000001)
+    test.assert_approx(o.z1, 7.0 + 3.3 + 0.4, 0.0000001)
+    test.assert_eq(o.seg, 3)
+
+@test
+fn test_connectors_on_every_edge_open_every_wall_with_the_angle_of_its_normal() [fs]
+    let h = fixture("edges", encparams.defaults())
+    test.assert_eq(opening(h, "J1").face, "left")
+    test.assert_eq(opening(h, "J2").face, "right")
+    test.assert_eq(opening(h, "J3").face, "top")
+    test.assert_eq(opening(h, "J4").face, "bottom")
+    test.assert_approx(opening(h, "J2").ang, 0.0, 0.0000001)
+    test.assert_approx(opening(h, "J3").ang, 90.0, 0.0000001)
+    test.assert_approx(opening(h, "J4").ang, -90.0, 0.0000001)
+    // J3 is the top edge's connector at x = 130 in the file: 30 in the frame.
+    test.assert_approx(opening(h, "J3").cx, 30.0, 0.0000001)
+    test.assert_approx(opening(h, "J3").cy, 40.0, 0.0000001)
+    // J5 is in the middle and has none.
+    test.assert_eq(opening(h, "J5").part, "")
+
+@test
+fn test_a_connector_on_the_back_opens_below_the_boards_underside()
+    let hdr = "    (property \"Height\" \"5\" (at 0 0 0))\n"
+    let text = pcb(30.0, 20.0, comp("J7", "Connector_Generic:Conn_01x02", 103.0, 110.0, 3.0, 4.0, "B.Cu", hdr))
+    let h = housing_of(text, encparams.defaults())
+    let o = opening(h, "J7")
+    test.assert_eq(o.face, "left")
+    test.assert_approx(o.z0, h.z_bb - 5.0 - 0.4, 0.0000001)
+    test.assert_approx(o.z1, h.z_bb + 0.4, 0.0000001)
+
+// ── LEDs, buttons, pipes and caps ───────────────────────────────────
+
+@test
+fn test_an_led_and_a_button_on_the_front_get_round_holes_in_the_lid() [fs]
+    let h = fixture("usbc_board", encparams.defaults())
+    let d1 = opening(h, "D1")
+    test.assert_eq(d1.face, "lid")
+    test.assert_eq(d1.shape, "round")
+    test.assert_eq(d1.part, "lid")
+    test.assert_eq(d1.w, 3.0)
+    test.assert_approx(d1.cx, 18.0, 0.0000001)
+    test.assert_approx(d1.cy, 6.0, 0.0000001)
+    test.assert_eq(d1.z0, h.z_split)
+    test.assert_eq(d1.z1, h.z_top)
+    test.assert_eq(opening(h, "SW1").w, 3.0)
+    test.assert_eq(list.len(h.caps), 0)
+
+@test
+fn test_the_pipe_and_the_cap_modes_make_a_larger_hole_and_a_printed_part() [fs]
+    var p = encparams.defaults()
+    p.led = LedPipe
+    p.button = ButtonCap
+    let h = fixture("usbc_board", p)
+    test.assert_approx(opening(h, "D1").w, 3.2, 0.0000001)
+    test.assert_approx(opening(h, "SW1").w, 3.4, 0.0000001)
+    test.assert_eq(list.len(h.caps), 2)
+    let pipe = cap_of(h, "D1")
+    test.assert_eq(pipe.kind, "pipe")
+    test.assert_eq(pipe.ref, "D1")
+    test.assert_eq(pipe.stem_d, 3.0)
+    // The LED is 1.1 mm tall; the pipe stands 0.3 above it and ends at the lid's top.
+    test.assert_approx(pipe.z0, h.z_bt + 1.1 + 0.3, 0.0000001)
+    test.assert_eq(pipe.z1, h.z_top)
+    test.assert_eq(pipe.flange_d, 5.0)
+    test.assert_approx(pipe.fz0, h.z_split - 0.6, 0.0000001)
+    test.assert_eq(pipe.fz1, h.z_split)
+    let cap = cap_of(h, "SW1")
+    test.assert_eq(cap.kind, "cap")
+    test.assert_approx(cap.z0, h.z_bt + 1.6 + 0.3, 0.0000001)
+    test.assert_approx(cap.z1, h.z_top + 0.4, 0.0000001)
+
+@test
+fn test_an_led_and_a_button_on_the_back_get_holes_in_the_floor_and_no_part()
+    let led = "    (property \"Opening\" \"led\" (at 0 0 0))\n"
+    let btn = "    (property \"Opening\" \"button\" (at 0 0 0))\n"
+    let text = pcb(30.0,
+        20.0,
+        comp("D5", "Foo:Lamp", 110.0, 110.0, 1.0, 1.0, "B.Cu", led) + comp("S5", "Foo:Key", 120.0, 110.0, 2.0, 2.0, "B.Cu", btn))
+    var p = encparams.defaults()
+    p.led = LedPipe
+    p.button = ButtonCap
+    let h = housing_of(text, p)
+    test.assert_eq(opening(h, "D5").face, "floor")
+    test.assert_eq(opening(h, "D5").part, "base")
+    test.assert_eq(opening(h, "D5").w, 3.0)
+    test.assert_eq(opening(h, "S5").face, "floor")
+    test.assert_eq(opening(h, "S5").w, 3.0)
+    test.assert_eq(opening(h, "D5").z1, 2.4)
+    test.assert_eq(list.len(h.caps), 0)
+
+@test
+fn test_none_modes_leave_the_lid_closed() [fs]
+    var p = encparams.defaults()
+    p.led = LedNone
+    p.button = ButtonNone
+    let h = fixture("usbc_board", p)
+    test.assert_eq(list.len(h.openings), 1)
+    test.assert_eq(h.openings[0].name, "J1")
+
+// ── Extra openings ──────────────────────────────────────────────────
+
+@test
+fn test_extra_openings_in_the_lid_the_floor_and_the_wall_take_the_file_coordinates() [fs]
+    var p = encparams.defaults()
+    p.extras = [encparams.lid_extra("vent", 115.0, 117.0, 6.0, 2.0),
+        encparams.floor_extra("drain", 110.0, 105.0, 4.0, 4.0),
+        encparams.side_extra("slot", 0, 10.0, 1.5, 6.0, 2.5)]
+    let h = fixture("usbc_board", p)
+    let vent = opening(h, "vent")
+    test.assert_eq(vent.face, "lid")
+    test.assert_eq(vent.shape, "box")
+    test.assert_approx(vent.cx, 15.0, 0.0000001)
+    test.assert_approx(vent.cy, 3.0, 0.0000001)
+    test.assert_eq(vent.part, "lid")
+    let drain = opening(h, "drain")
+    test.assert_eq(drain.face, "floor")
+    test.assert_eq(drain.part, "base")
+    test.assert_approx(drain.cy, 15.0, 0.0000001)
+    let slot = opening(h, "slot")
+    // Segment 0 is the top edge from (100, 100) to (130, 100); 10 mm along is x = 110.
+    test.assert_eq(slot.face, "top")
+    test.assert_eq(slot.part, "both")
+    test.assert_approx(slot.cx, 10.0, 0.0000001)
+    test.assert_approx(slot.cy, 20.0, 0.0000001)
+    test.assert_approx(slot.z0, h.z_bt + 1.5 - 1.25, 0.0000001)
+    test.assert_approx(slot.z1, h.z_bt + 1.5 + 1.25, 0.0000001)
+    test.assert_approx(slot.ang, 90.0, 0.0000001)
+
+// ── Screws ──────────────────────────────────────────────────────────
+
+@test
+fn test_the_screw_is_the_shortest_standard_length_with_the_thread_the_parameters_ask_for() [fs]
+    let screwed = fixture("usbc_board", encparams.defaults())
+    // 2.4 floor + 3.0 standoff + 1.6 board = 7.0, and 3.0 of thread: 10.
+    test.assert_eq(screwed.screw_len, 10.0)
+    test.assert_approx(screwed.pilot_len, 3.5, 0.0000001)
+    var p = encparams.defaults()
+    p.lid = LidSnap
+    let snap = fixture("usbc_board", p)
+    test.assert_eq(snap.screw_len, 5.0)
+    test.assert_approx(snap.pilot_len, 3.9, 0.0000001)
+    test.assert_eq(encmodel.pick_screw(10.0), 10.0)
+    test.assert_eq(encmodel.pick_screw(10.1), 12.0)
+    test.assert_eq(encmodel.pick_screw(41.0), 0.0)
+    test.assert_eq(list.len(encmodel.screw_lengths()), 13)
+
+@test
+fn test_a_thread_longer_than_any_screw_leaves_no_length_and_no_hole_depth() [fs]
+    var p = encparams.defaults()
+    p.engage_min = 80.0
+    let h = fixture("usbc_board", p)
+    test.assert_eq(h.screw_len, 0.0)
+    test.assert_eq(h.pilot_len, 0.0)
+
+// ── The geometry ────────────────────────────────────────────────────
+
+@test
+fn test_a_rectangle_grows_by_the_offset_on_every_side()
+    let r = [kpcbgeom.pt(0.0, 0.0), kpcbgeom.pt(4.0, 0.0), kpcbgeom.pt(4.0, 3.0), kpcbgeom.pt(0.0, 3.0)]
+    test.assert_approx(encgeom.offset_area(r, 1.0), 6.0 * 5.0, 0.0000001)
+    test.assert_approx(encgeom.offset_area(r, -0.5), 3.0 * 2.0, 0.0000001)
+    test.assert_approx(encgeom.offset_area(r, 0.0), 12.0, 0.0000001)
+
+@test
+fn test_an_l_shape_keeps_sharp_corners_and_its_concave_corner_moves_in()
+    let l = [kpcbgeom.pt(0.0, 0.0),
+        kpcbgeom.pt(4.0, 0.0),
+        kpcbgeom.pt(4.0, 2.0),
+        kpcbgeom.pt(2.0, 2.0),
+        kpcbgeom.pt(2.0, 4.0),
+        kpcbgeom.pt(0.0, 4.0)]
+    // Area 12, perimeter 16, five convex corners and one concave: the
+    // offset area is 12 + 16 d + 4 d^2 for sharp corners (five of 1 d^2 less one).
+    test.assert_approx(encgeom.offset_area(l, 0.5), 12.0 + 16.0 * 0.5 + 4.0 * 0.25, 0.0000001)
+
+@test
+fn test_consecutive_equal_points_are_ignored_and_a_reversal_is_a_vertex_pushed_out_along_the_normal()
+    let dup = [kpcbgeom.pt(0.0, 0.0),
+        kpcbgeom.pt(0.0, 0.0),
+        kpcbgeom.pt(2.0, 0.0),
+        kpcbgeom.pt(2.0, 2.0),
+        kpcbgeom.pt(0.0, 2.0)]
+    test.assert_approx(encgeom.offset_area(dup, 1.0), 16.0, 0.0000001)
+    // A spike that turns back on itself has no bisector; the vertex moves along the first normal.
+    let spike = encgeom.offset_poly([kpcbgeom.pt(0.0, 0.0), kpcbgeom.pt(4.0, 0.0), kpcbgeom.pt(0.0, 0.0), kpcbgeom.pt(0.0, 4.0)],
+        1.0)
+    test.assert_eq(list.len(spike), 4)
+
+@test
+fn test_the_overlap_of_two_intervals_and_the_direction_of_a_segment()
+    test.assert_eq(encgeom.overlap(0.0, 5.0, 3.0, 8.0), 2.0)
+    test.assert_eq(encgeom.overlap(0.0, 2.0, 3.0, 8.0), 0.0)
+    let d = encgeom.direction(kpcbgeom.pt(1.0, 1.0), kpcbgeom.pt(4.0, 5.0))
+    test.assert_eq(d[0], 0.6)
+    test.assert_eq(d[1], 0.8)
+    test.assert_eq(d[2], 5.0)
+
+@test
+fn test_a_cylinder_has_the_area_of_its_polygon()
+    let a = encgeom.cyl_area(6.0)
+    test.assert(a < math.pi() * 9.0)
+    test.assert(a > math.pi() * 9.0 * 0.99)
+    test.assert_approx(a, 16.0 * 9.0 * math.sin(2.0 * math.pi() / 32.0), 0.0000001)
+
+@test
+fn test_the_defaults_and_their_constructors()
+    let p = encparams.defaults()
+    test.assert_eq(p.wall, 2.4)
+    test.assert_eq(p.nozzle, 0.4)
+    test.assert_eq(list.len(p.extras), 0)
+    test.assert_eq(encparams.lid_extra("a", 1.0, 2.0, 3.0, 4.0).face, "lid")
+    test.assert_eq(encparams.floor_extra("a", 1.0, 2.0, 3.0, 4.0).face, "floor")
+    let s = encparams.side_extra("a", 2, 5.0, 1.0, 3.0, 4.0)
+    test.assert_eq(s.face, "side")
+    test.assert_eq(s.seg, 2)
+    test.assert_eq(s.x, 5.0)
+
+@test
+fn test_a_triangle_grows_by_the_cotangents_of_its_half_angles()
+    // The 3-4-5 triangle: area 6, perimeter 12, and the cotangents of the
+    // half angles 1, 3 and 2 sum to 6, so the offset area is 6 + 12 d + 6 d^2.
+    let t = [kpcbgeom.pt(0.0, 0.0), kpcbgeom.pt(4.0, 0.0), kpcbgeom.pt(0.0, 3.0)]
+    test.assert_approx(encgeom.offset_area(t, 0.5), 13.5, 0.0000001)
+    test.assert_approx(encgeom.offset_area(t, 1.0), 24.0, 0.0000001)
+
+@test
+fn test_the_boards_frame_is_shifted_flipped_and_kept_counter_clockwise()
+    // A file outline running down the left edge first: (100,100) (100,110) (120,110).
+    let pts = encgeom.to_housing([kpcbgeom.pt(100.0, 100.0),
+        kpcbgeom.pt(120.0, 100.0),
+        kpcbgeom.pt(120.0, 110.0),
+        kpcbgeom.pt(100.0, 110.0)],
+    100.0, 110.0)
+    test.assert_eq(list.len(pts), 4)
+    test.assert_eq(pts[0].x, 0.0)
+    test.assert_eq(pts[0].y, 0.0)
+    test.assert_eq(pts[1].x, 20.0)
+    test.assert_eq(pts[1].y, 0.0)
+    test.assert_eq(pts[3].x, 0.0)
+    test.assert_eq(pts[3].y, 10.0)
+    test.assert_eq(kpcbgeom.signed_area(pts), 200.0)
+
+@test
+fn test_a_known_part_has_its_height_and_an_unknown_one_the_parameters_stand_in() [fs]
+    var p = encparams.defaults()
+    p.unknown_height = 2.0
+    match fs.read_bytes("tests/fixtures/usbc_board.kicad_pcb")
+        None    => test.assert(false)
+        Some(s) =>
+            match kpcbread.read(s, "usbc_board")
+                Err(_) => test.assert(false)
+                Ok(b)  =>
+                    test.assert_eq(encmodel.height_of(b.parts[0], p), 3.3)
+                    let none = Footprint { ref: "X",
+                        value: "",
+                        name: "",
+                        x: 0.0,
+                        y: 0.0,
+                        rot: 0.0,
+                        side: "F",
+                        kind: "other",
+                        cx0: 0.0,
+                        cy0: 0.0,
+                        cx1: 0.0,
+                        cy1: 0.0,
+                        court: "",
+                        model: "",
+                        mox: 0.0,
+                        moy: 0.0,
+                        moz: 0.0,
+                        msx: 1.0,
+                        msy: 1.0,
+                        msz: 1.0,
+                        mrx: 0.0,
+                        mry: 0.0,
+                        mrz: 0.0,
+                        height: 0.0,
+                        height_source: "none",
+                        edge: "",
+                        edge_seg: -1,
+                        edge_gap: 0.0,
+                        keys: [],
+                        vals: [],
+                        line: 0,
+                        col: 0 }
+                    test.assert_eq(encmodel.height_of(none, p), 2.0)

@@ -1,0 +1,75 @@
+// encgeom — the plane geometry a housing is built from.
+//
+// The housing frame has x to the right and y upward, as OpenSCAD draws
+// it, with the board's bounding box starting at the origin.  The board
+// file's frame has y downward; `to_housing` turns one into the other and
+// keeps the points counter-clockwise, so that the area of an outline is
+// positive and an offset by a positive distance grows it.
+
+use kpcbgeom
+
+// The number of sides of every cylinder in the text this package
+// writes.  The volume of a cylinder is that of the polygon, not the
+// circle.
+pub const CYL_FN = 32
+
+// The outline `pts` of the board file, with the bounding box's low x
+// `minx` and high y `maxy`, in the housing frame: x is shifted, y is
+// flipped, and the points are reversed to keep the winding positive.
+pub fn to_housing(pts: [Pt], minx: Float, maxy: Float) -> [Pt] []
+    var out: [Pt] = []
+    let n = list.len(pts)
+    for i in 0..n
+        let q = pts[n - 1 - i]
+        list.push(out, Pt { x: q.x - minx, y: maxy - q.y })
+    out
+
+// The polygon `pts`, counter-clockwise, grown by `d` with sharp corners:
+// every vertex moves along the bisector of its two edges to where the
+// two offset edges meet.  This is what OpenSCAD's `offset(delta = d)`
+// draws, as long as no edge disappears.  Consecutive equal points are
+// ignored.
+pub fn offset_poly(pts: [Pt], d: Float) -> [Pt] []
+    var clean: [Pt] = []
+    for p in pts
+        let n = list.len(clean)
+        if n == 0 or kpcbgeom.dist(clean[n - 1], p) > 0.0000001
+            list.push(clean, p)
+    let n = list.len(clean)
+    var out: [Pt] = []
+    for i in 0..n
+        let prev = clean[(i + n - 1) % n]
+        let cur = clean[i]
+        let next = clean[(i + 1) % n]
+        let l1 = kpcbgeom.dist(prev, cur)
+        let l2 = kpcbgeom.dist(cur, next)
+        let n1x = (cur.y - prev.y) / l1
+        let n1y = (prev.x - cur.x) / l1
+        let n2x = (next.y - cur.y) / l2
+        let n2y = (cur.x - next.x) / l2
+        let k = 1.0 + n1x * n2x + n1y * n2y
+        if k < 0.000000001
+            list.push(out, Pt { x: cur.x + d * n1x, y: cur.y + d * n1y })
+        else
+            list.push(out, Pt { x: cur.x + d * (n1x + n2x) / k, y: cur.y + d * (n1y + n2y) / k })
+    out
+
+// The area of the polygon grown by `d`.
+pub fn offset_area(pts: [Pt], d: Float) -> Float []
+    kpcbgeom.signed_area(offset_poly(pts, d))
+
+// The area of a cylinder of diameter `d` seen from above, as the
+// `CYL_FN`-sided polygon that is drawn.
+pub fn cyl_area(d: Float) -> Float []
+    let r = d / 2.0
+    CYL_FN as Float / 2.0 * r * r * math.sin(2.0 * math.pi() / CYL_FN as Float)
+
+// The length of the overlap of the intervals `[a0, a1]` and `[b0, b1]`.
+pub fn overlap(a0: Float, a1: Float, b0: Float, b1: Float) -> Float []
+    math.max(0.0, math.min(a1, b1) - math.max(a0, b0))
+
+// The unit vector along the segment from `a` to `b`, and its length, as
+// `[ux, uy, length]`.
+pub fn direction(a: Pt, b: Pt) -> [Float] []
+    let len = kpcbgeom.dist(a, b)
+    [(b.x - a.x) / len, (b.y - a.y) / len, len]

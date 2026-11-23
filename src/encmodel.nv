@@ -1,0 +1,517 @@
+// encmodel — the housing as a model of its own.
+//
+// `build` turns the facts of a board and the parameters into a
+// `Housing`: the levels along z, the standoffs and pillars, the openings
+// with their positions, the parts that are printed apart from the base
+// and the lid, and a block for every part of the board.  Nothing here
+// writes OpenSCAD.  `encscad` writes text from the model, `encchecks`
+// tests it, and `encbill` measures it.
+//
+// The housing frame has the board's bounding box starting at the origin,
+// x to the right and y upward, with z = 0 at the underside of the base.
+// From the bottom up the levels are:
+//
+//   z = 0          the underside of the floor
+//   floor_t        the top of the floor and the foot of the standoffs
+//   z_bb           the board's underside, the top of the standoffs
+//   z_bt           the board's front surface, the foot of the lid pillars
+//   z_step         the top of the outer half of the wall
+//   z_split        the top of the inner half of the wall and the
+//                  underside of the lid's plate
+//   z_top          the top of the lid
+//
+// The wall is two halves side by side.  The inner half, `wall / 2`
+// thick, goes up to `z_split`.  The outer half stops at `z_step`, and the
+// lid's skirt takes its place above that, `lid_gap` clear of the inner
+// half and of the step.
+
+use kpcbboard
+use kpcbgeom
+use encgeom
+use encparams
+
+// A standoff of the base and the pillar above it, centred on the board's
+// mounting hole.  `hole` is the drill of the board's hole.
+pub struct Post
+    ref: Str
+    x: Float
+    y: Float
+    hole: Float
+
+// A cut through the wall, the floor or the lid.
+//
+// `face` is `left`, `right`, `top` or `bottom` for a hole through the
+// wall, named by the side of the board as the board file draws it, and
+// `lid` or `floor` for a hole through a plate.  `shape` is `box` or
+// `round`.  A wall opening is centred at (cx, cy) on the board's edge,
+// `ang` degrees from the x axis along the outward normal, `w` wide along
+// the wall and from `z0` to `z1` high; `seg` is the outline segment of
+// the board file, and `along` the distance of the centre from the
+// segment's end in the housing's counter-clockwise order.  A plate
+// opening is centred at (cx, cy), a box `w` by `h` or a circle of
+// diameter `w`, through the plate from `z0` to `z1`.  `part` is `base`,
+// `lid` or `both`: a wall opening also notches the lid's skirt.
+pub struct Opening
+    name: Str
+    ref: Str
+    face: Str
+    shape: Str
+    cx: Float
+    cy: Float
+    ang: Float
+    w: Float
+    h: Float
+    z0: Float
+    z1: Float
+    seg: Int
+    along: Float
+    part: Str
+
+// A part printed apart from the base and the lid: a light pipe or a
+// button cap.  The stem is a cylinder of diameter `stem_d` from `z0` to
+// `z1`, and the flange is a disc of `flange_d` from `fz0` to `fz1`
+// that holds it under the lid.
+pub struct Cap
+    ref: Str
+    kind: Str
+    x: Float
+    y: Float
+    stem_d: Float
+    z0: Float
+    z1: Float
+    flange_d: Float
+    fz0: Float
+    fz1: Float
+
+// A part of the board as a box, for the assembly's preview and for the
+// clearance tests.  `opening` says that a hole in the housing is made for
+// it, so it may reach the wall, and `known` that its height is a fact and
+// not the parameter's stand-in.
+pub struct Block
+    ref: Str
+    kind: Str
+    side: Str
+    opening: Bool
+    known: Bool
+    x0: Float
+    y0: Float
+    x1: Float
+    y1: Float
+    z0: Float
+    z1: Float
+
+// The housing.
+//
+// `outline`, `cut_sizes` and `cut_pts` are the board's outline and
+// cut-outs in the housing frame, the cut-outs' points one after another
+// in `cut_pts` and their counts in `cut_sizes`.  `width` and `depth` are
+// the board's extent.  `screw_len` is the standard screw length, zero
+// when none fits, and `pilot_len` the depth of the screw's hole: above
+// the board's surface in a lid pillar for a screwed lid, below the
+// board's underside in a standoff for a snap lid.
+pub struct Housing
+    params: Params
+    source: Str
+    outline: [Pt]
+    cut_sizes: [Int]
+    cut_pts: [Pt]
+    minx: Float
+    maxy: Float
+    width: Float
+    depth: Float
+    board_t: Float
+    top_max: Float
+    bottom_max: Float
+    h_st: Float
+    top_space: Float
+    z_bb: Float
+    z_bt: Float
+    z_split: Float
+    z_step: Float
+    z_top: Float
+    z_skirt: Float
+    screw_len: Float
+    pilot_len: Float
+    posts: [Post]
+    openings: [Opening]
+    caps: [Cap]
+    blocks: [Block]
+
+// The standard lengths of the screws, in millimetres.
+pub fn screw_lengths() -> [Float] []
+    [4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 25.0, 30.0, 35.0, 40.0]
+
+// The shortest standard screw of at least `need` millimetres, or zero
+// when there is none.
+pub fn pick_screw(need: Float) -> Float []
+    var found = 0.0
+    for l in screw_lengths()
+        if found == 0.0 and l >= need
+            found = l
+    found
+
+// The height a part is taken to have: its own, or the parameter's for a
+// part whose height is unknown.
+pub fn height_of(p: Footprint, params: Params) -> Float []
+    if p.height_source == "none"
+        params.unknown_height
+    else
+        p.height
+
+// The tallest height on `side`, over the parts that are not holes.
+fn tallest(parts: [Footprint], side: Str, params: Params) -> Float
+    var best = 0.0
+    for p in parts
+        if p.side == side and p.kind != "hole"
+            best = math.max(best, height_of(p, params))
+    best
+
+// A point of the board file in the housing frame.
+fn flip(x: Float, y: Float, minx: Float, maxy: Float) -> Pt
+    Pt { x: x - minx, y: maxy - y }
+
+// The cut-outs of the board, flattened into sizes and points.
+fn flat_cutouts(b: Board, minx: Float, maxy: Float) -> [Pt]
+    var out: [Pt] = []
+    for c in b.cutouts
+        for q in encgeom.to_housing(c.pts, minx, maxy)
+            list.push(out, q)
+    out
+
+// The sizes of the cut-outs of the board.
+fn cut_counts(b: Board) -> [Int]
+    list.map(b.cutouts, c => list.len(c.pts))
+
+// The box of a part in the housing frame.
+fn block_of(p: Footprint, h: Float, minx: Float, maxy: Float, z_bb: Float, z_bt: Float,
+            has_opening: Bool) -> Block
+    let x0 = p.cx0 - minx
+    let x1 = p.cx1 - minx
+    let y0 = maxy - p.cy1
+    let y1 = maxy - p.cy0
+    if p.side == "B"
+        Block { ref: p.ref,
+            kind: p.kind,
+            side: "B",
+            opening: has_opening,
+            known: p.height_source != "none",
+            x0: x0,
+            y0: y0,
+            x1: x1,
+            y1: y1,
+            z0: z_bb - h,
+            z1: z_bb }
+    else
+        Block { ref: p.ref,
+            kind: p.kind,
+            side: "F",
+            opening: has_opening,
+            known: p.height_source != "none",
+            x0: x0,
+            y0: y0,
+            x1: x1,
+            y1: y1,
+            z0: z_bt,
+            z1: z_bt + h }
+
+// The angle in degrees, in (-180, 180], of the outward normal of a wall
+// segment whose direction is `d`, as `[ux, uy, length]`: the normal of
+// a counter-clockwise outline points to the right of its direction.
+fn angle_of(d: [Float]) -> Float
+    let a = math.atan2(-d[0], d[1]) * 180.0 / math.pi()
+    if a <= -179.9999999
+        a + 360.0
+    else
+        a
+
+// The wall opening of a connector at the board edge segment `seg`.
+//
+// The segment is taken in the housing's counter-clockwise order, which
+// reverses the file's: it starts at the file's second point and ends at
+// the first.  The courtyard's corners are projected onto the segment to
+// find the opening's extent along the wall, and the opening is `margin`
+// larger than that on every side.
+fn wall_opening(name: Str, ref: Str, face: Str, outline: [Pt], seg: Int, box: Rect, z0: Float,
+                z1: Float, margin: Float, minx: Float, maxy: Float) -> Opening
+    let a = outline[seg]
+    let b = outline[(seg + 1) % list.len(outline)]
+    let s = flip(b.x, b.y, minx, maxy)
+    let e = flip(a.x, a.y, minx, maxy)
+    let d = encgeom.direction(s, e)
+    let corners = [Pt { x: box.x0 - minx, y: maxy - box.y0 },
+        Pt { x: box.x1 - minx, y: maxy - box.y0 },
+        Pt { x: box.x1 - minx, y: maxy - box.y1 },
+        Pt { x: box.x0 - minx, y: maxy - box.y1 }]
+    var lo = math.infinity()
+    var hi = -math.infinity()
+    for c in corners
+        let t = (c.x - s.x) * d[0] + (c.y - s.y) * d[1]
+        lo = math.min(lo, t)
+        hi = math.max(hi, t)
+    let along = (lo + hi) / 2.0
+    let ang = angle_of(d)
+    Opening { name: name,
+        ref: ref,
+        face: face,
+        shape: "box",
+        cx: s.x + d[0] * along,
+        cy: s.y + d[1] * along,
+        ang: ang,
+        w: hi - lo + 2.0 * margin,
+        h: z1 - z0,
+        z0: z0,
+        z1: z1,
+        seg: seg,
+        along: along,
+        part: "both" }
+
+// An opening through a plate at the board position (cx, cy).
+fn plate_opening(name: Str, ref: Str, face: Str, shape: Str, cx: Float, cy: Float, w: Float,
+                 h: Float, z0: Float, z1: Float) -> Opening
+    Opening { name: name,
+        ref: ref,
+        face: face,
+        shape: shape,
+        cx: cx,
+        cy: cy,
+        ang: 0.0,
+        w: w,
+        h: h,
+        z0: z0,
+        z1: z1,
+        seg: -1,
+        along: 0.0,
+        part: (if face == "lid" then "lid" else "base") }
+
+// The name of the side the outward normal at angle `ang` degrees
+// points to in the board file's frame, where y grows downward: the
+// housing frame's y is the file's flipped.
+fn face_of(ang: Float) -> Str
+    let c = math.cos(ang * math.pi() / 180.0)
+    let s = math.sin(ang * math.pi() / 180.0)
+    if math.abs(c) >= math.abs(s)
+        if c > 0.0
+            "right"
+        else
+            "left"
+    else
+        if s > 0.0
+            "top"
+        else
+            "bottom"
+
+// Builds the housing for a board with the parameters.
+//
+// ```novo
+// use std.bytes
+// use kpcbread
+// use encmodel
+// use encparams
+//
+// fn main() [io]
+//     let src = bytes.from_str("(kicad_pcb (version 20241229) (gr_rect (start 0 0) (end 20 10) (layer Edge.Cuts)))")
+//     match kpcbread.read(src, "a.kicad_pcb")
+//         Err(e) => println(e.message())
+//         Ok(b)  =>
+//             let h = encmodel.build(b, encparams.defaults())
+//             println("${h.z_top}")   // 9.6
+// ```
+pub fn build(b: Board, p: Params) -> Housing []
+    let minx = b.box.x0
+    let maxy = b.box.y1
+    let top_max = tallest(b.parts, "F", p)
+    let bottom_max = tallest(b.parts, "B", p)
+    let h_st = if p.standoff_h > 0.0
+        p.standoff_h
+    else
+        math.max(p.standoff_min, bottom_max + p.headroom_bottom)
+    let top_space = if p.top_space > 0.0
+        p.top_space
+    else
+        top_max + p.headroom_top
+    let z_bb = p.floor_t + h_st
+    let z_bt = z_bb + b.thickness
+    let z_split = z_bt + top_space
+    let z_step = z_split - p.lip_h
+    let z_top = z_split + p.lid_t
+    let z_skirt = z_step + p.lid_gap
+    let outline = encgeom.to_housing(b.outline, minx, maxy)
+    var posts: [Post] = []
+    for h in kpcbboard.mount_holes(b, p.mount_min_drill)
+        list.push(posts, Post { ref: h.owner, x: h.x - minx, y: maxy - h.y, hole: h.drill })
+    let base_len = if p.lid == LidSnap
+        b.thickness
+    else
+        p.floor_t + h_st + b.thickness
+    let screw = pick_screw(base_len + p.engage_min)
+    let pilot = if screw > 0.0
+        screw - base_len + 0.5
+    else
+        0.0
+    var openings: [Opening] = []
+    var caps: [Cap] = []
+    var blocks: [Block] = []
+    for q in b.parts
+        if q.kind != "hole"
+            let he = height_of(q, p)
+            let at = flip(q.x, q.y, minx, maxy)
+            var opened = false
+            if q.kind == "connector" and q.edge != ""
+                opened = true
+                let z0 = if q.side == "B"
+                    z_bb - he - p.opening_margin
+                else
+                    z_bt - p.opening_margin
+                let z1 = if q.side == "B"
+                    z_bb + p.opening_margin
+                else
+                    z_bt + he + p.opening_margin
+                let o = wall_opening(q.ref,
+                    q.ref,
+                    "",
+                    b.outline,
+                    q.edge_seg,
+                    kpcbboard.court_rect(q),
+                    z0,
+                    z1,
+                    p.opening_margin,
+                    minx,
+                    maxy)
+                list.push(openings, Opening { name: o.name,
+                    ref: o.ref,
+                    face: face_of(o.ang),
+                    shape: o.shape,
+                    cx: o.cx,
+                    cy: o.cy,
+                    ang: o.ang,
+                    w: o.w,
+                    h: o.h,
+                    z0: o.z0,
+                    z1: o.z1,
+                    seg: o.seg,
+                    along: o.along,
+                    part: o.part })
+            if q.kind == "led" and p.led != LedNone
+                opened = true
+                let pipe = p.led == LedPipe and q.side == "F"
+                let d = if pipe
+                    p.led_d + 0.2
+                else
+                    p.led_d
+                if q.side == "F"
+                    list.push(openings,
+                        plate_opening(q.ref, q.ref, "lid", "round", at.x, at.y, d, 0.0, z_split, z_top))
+                else
+                    list.push(openings,
+                        plate_opening(q.ref, q.ref, "floor", "round", at.x, at.y, d, 0.0, 0.0, p.floor_t))
+                if pipe
+                    list.push(caps, Cap { ref: q.ref,
+                        kind: "pipe",
+                        x: at.x,
+                        y: at.y,
+                        stem_d: p.led_d,
+                        z0: z_bt + he + 0.3,
+                        z1: z_top,
+                        flange_d: p.led_d + 2.0,
+                        fz0: z_split - 0.6,
+                        fz1: z_split })
+            if q.kind == "button" and p.button != ButtonNone
+                opened = true
+                let cap = p.button == ButtonCap and q.side == "F"
+                let d = if cap
+                    p.button_d + 0.4
+                else
+                    p.button_d
+                if q.side == "F"
+                    list.push(openings,
+                        plate_opening(q.ref, q.ref, "lid", "round", at.x, at.y, d, 0.0, z_split, z_top))
+                else
+                    list.push(openings,
+                        plate_opening(q.ref, q.ref, "floor", "round", at.x, at.y, d, 0.0, 0.0, p.floor_t))
+                if cap
+                    list.push(caps, Cap { ref: q.ref,
+                        kind: "cap",
+                        x: at.x,
+                        y: at.y,
+                        stem_d: p.button_d,
+                        z0: z_bt + he + 0.3,
+                        z1: z_top + 0.4,
+                        flange_d: p.button_d + 2.0,
+                        fz0: z_split - 0.6,
+                        fz1: z_split })
+            list.push(blocks, block_of(q, he, minx, maxy, z_bb, z_bt, opened))
+    for x in p.extras
+        list.push(openings, extra_opening(x, b, outline, minx, maxy, p, z_bt, z_split, z_top))
+    Housing { params: p,
+        source: b.file,
+        outline: outline,
+        cut_sizes: cut_counts(b),
+        cut_pts: flat_cutouts(b, minx, maxy),
+        minx: minx,
+        maxy: maxy,
+        width: b.box.x1 - b.box.x0,
+        depth: b.box.y1 - b.box.y0,
+        board_t: b.thickness,
+        top_max: top_max,
+        bottom_max: bottom_max,
+        h_st: h_st,
+        top_space: top_space,
+        z_bb: z_bb,
+        z_bt: z_bt,
+        z_split: z_split,
+        z_step: z_step,
+        z_top: z_top,
+        z_skirt: z_skirt,
+        screw_len: screw,
+        pilot_len: pilot,
+        posts: posts,
+        openings: openings,
+        caps: caps,
+        blocks: blocks }
+
+// The opening an `Extra` asks for.  A side opening on a segment the
+// outline does not have keeps the segment number, so that a check can name it.
+fn extra_opening(x: Extra, b: Board, outline: [Pt], minx: Float, maxy: Float, p: Params,
+                 z_bt: Float, z_split: Float, z_top: Float) -> Opening
+    if x.face == "lid"
+        plate_opening(x.name, "", "lid", "box", x.x - minx, maxy - x.y, x.w, x.h, z_split, z_top)
+    elif x.face == "floor"
+        plate_opening(x.name, "", "floor", "box", x.x - minx, maxy - x.y, x.w, x.h, 0.0, p.floor_t)
+    elif x.seg < 0 or x.seg >= list.len(b.outline)
+        Opening { name: x.name,
+            ref: "",
+            face: "",
+            shape: "box",
+            cx: 0.0,
+            cy: 0.0,
+            ang: 0.0,
+            w: x.w,
+            h: x.h,
+            z0: 0.0,
+            z1: 0.0,
+            seg: x.seg,
+            along: x.x,
+            part: "both" }
+    else
+        let a = b.outline[x.seg]
+        let c = b.outline[(x.seg + 1) % list.len(b.outline)]
+        let s = flip(c.x, c.y, minx, maxy)
+        let e = flip(a.x, a.y, minx, maxy)
+        let d = encgeom.direction(s, e)
+        let along = d[2] - x.x
+        let ang = angle_of(d)
+        let zc = z_bt + x.z
+        Opening { name: x.name,
+            ref: "",
+            face: face_of(ang),
+            shape: "box",
+            cx: s.x + d[0] * along,
+            cy: s.y + d[1] * along,
+            ang: ang,
+            w: x.w,
+            h: x.h,
+            z0: zc - x.h / 2.0,
+            z1: zc + x.h / 2.0,
+            seg: x.seg,
+            along: along,
+            part: "both" }

@@ -1,0 +1,173 @@
+// enc_bill_tests — the bill of the printed parts with their bounding
+// boxes and volumes, on a board whose answers are worked out by hand,
+// and the comparison of a mesh with a line of the bill.
+
+use std.test
+use std.bytes
+use std.fs
+use kpcbgeom
+use kpcbboard
+use kpcbread
+use encmodel
+use encparams
+use encbill
+
+// A 20 by 10 board with no holes and no parts.
+fn plain() -> Str
+    "(kicad_pcb (version 20241229) (general (thickness 1.6)) (gr_rect (start 100 100) (end 120 110) (layer \"Edge.Cuts\")))"
+
+// The housing of `text` with `p`.
+fn housing_of(text: Str, p: Params) -> Housing
+    match kpcbread.read(bytes.from_str(text), "t.kicad_pcb")
+        Ok(b)  => encmodel.build(b, p)
+        Err(e) =>
+            test.assert_eq(e.message(), "")
+            encmodel.build(Board { file: "",
+                version: 0,
+                thickness: 1.6,
+                outline: [kpcbgeom.pt(0.0, 0.0), kpcbgeom.pt(1.0, 0.0), kpcbgeom.pt(1.0, 1.0)],
+                cutouts: [],
+                area: 0.0,
+                box: kpcbgeom.rect(0.0, 0.0, 1.0, 1.0),
+                holes: [],
+                parts: [] },
+            p)
+
+// The line of the bill for `part`, or a stand-in.
+fn line_of(lines: [BillLine], part: Str) -> BillLine
+    match list.find(lines, l => l.part == part)
+        Some(l) => l
+        None    => BillLine { part: "missing ${part}",
+            kind: "",
+            count: 0,
+            x0: 0.0,
+            y0: 0.0,
+            z0: 0.0,
+            x1: 0.0,
+            y1: 0.0,
+            z1: 0.0,
+            volume: 0.0 }
+
+fn snap() -> Params
+    var p = encparams.defaults()
+    p.lid = LidSnap
+    p
+
+@test
+fn test_a_plain_board_has_the_volumes_worked_out_by_hand()
+    // Outer 25.8 x 15.8, the wall's two halves 23.4 x 13.4 and the cavity 21 x 11;
+    // the floor is 2.4 thick, the wall 8 high, the step at 5, the groove a ring of 28.8 mm2.
+    let lines = encbill.bill(housing_of(plain(), snap()))
+    test.assert_eq(list.len(lines), 2)
+    let base = line_of(lines, "base")
+    test.assert_approx(base.volume, 1656.48, 0.000001)
+    test.assert_eq(base.count, 1)
+    test.assert_eq(base.kind, "printed")
+    let lid = line_of(lines, "lid")
+    test.assert_approx(lid.volume, 897.536, 0.000001)
+
+@test
+fn test_the_boxes_are_the_outline_grown_by_the_wall_and_the_levels()
+    let lines = encbill.bill(housing_of(plain(), snap()))
+    let base = line_of(lines, "base")
+    test.assert_approx(base.x0, -2.9, 0.0000001)
+    test.assert_approx(base.y0, -2.9, 0.0000001)
+    test.assert_approx(base.x1, 22.9, 0.0000001)
+    test.assert_approx(base.y1, 12.9, 0.0000001)
+    test.assert_eq(base.z0, 0.0)
+    test.assert_approx(base.z1, 8.0, 0.0000001)
+    let lid = line_of(lines, "lid")
+    test.assert_approx(lid.z0, 5.2, 0.0000001)
+    test.assert_approx(lid.z1, 9.6, 0.0000001)
+
+@test
+fn test_a_screwed_lid_reaches_down_to_the_board_with_its_pillars()
+    let text = "(kicad_pcb (version 20241229) (general (thickness 1.6)) (gr_rect (start 100 100) (end 130 120) (layer \"Edge.Cuts\")) (footprint \"MountingHole:M\" (layer \"F.Cu\") (at 104 104) (pad \"\" np_thru_hole circle (at 0 0) (size 3.2 3.2) (drill 3.2) (layers \"*.Cu\"))))"
+    var p = encparams.defaults()
+    p.top_space = 6.0
+    let h = housing_of(text, p)
+    let lid = line_of(encbill.bill(h), "lid")
+    test.assert_approx(lid.z0, h.z_bt, 0.0000001)
+    // Over a thin board the skirt is lower than the pillars and sets the box.
+    let thin = housing_of(text, encparams.defaults())
+    test.assert_approx(line_of(encbill.bill(thin), "lid").z0, thin.z_skirt, 0.0000001)
+    let screws = line_of(encbill.bill(h), "screw M2.5 x 10")
+    test.assert_eq(screws.kind, "purchased")
+    test.assert_eq(screws.count, 1)
+    test.assert_eq(screws.volume, 0.0)
+
+@test
+fn test_the_screws_are_counted_by_standoff_and_named_by_their_length() [fs]
+    match fs.read_bytes("tests/fixtures/usbc_board.kicad_pcb")
+        None    => test.assert(false)
+        Some(s) =>
+            match kpcbread.read(s, "usbc_board")
+                Err(_) => test.assert(false)
+                Ok(b)  =>
+                    let lines = encbill.bill(encmodel.build(b, encparams.defaults()))
+                    test.assert_eq(list.len(lines), 3)
+                    test.assert_eq(lines[2].part, "screw M2.5 x 10")
+                    test.assert_eq(lines[2].count, 2)
+                    // The mesh OpenSCAD renders for the same text has these volumes.
+                    test.assert_approx(lines[0].volume, 4217.510, 0.01)
+                    test.assert_approx(lines[1].volume, 1991.218, 0.01)
+                    var p = encparams.defaults()
+                    p.led = LedPipe
+                    p.button = ButtonCap
+                    let more = encbill.bill(encmodel.build(b, p))
+                    test.assert_eq(list.len(more), 5)
+                    let pipe = line_of(more, "pipe_D1")
+                    test.assert_eq(pipe.kind, "printed")
+                    test.assert_approx(pipe.x1 - pipe.x0, 5.0, 0.0000001)
+                    test.assert_approx(pipe.z1, 12.9, 0.0000001)
+                    // A 3 mm stem 4.5 mm long and a flange of 5 mm and 0.6 mm round it.
+                    let stem = 16.0 / 1.0 * 1.5 * 1.5 * math.sin(2.0 * math.pi() / 32.0) * 2.0 / 2.0
+                    test.assert_approx(pipe.volume,
+                        stem * 4.5 + (16.0 * 2.5 * 2.5 * math.sin(2.0 * math.pi() / 32.0) - stem) * 0.6,
+                        0.0001)
+                    let cap = line_of(more, "cap_SW1")
+                    test.assert_approx(cap.z1, 13.3, 0.0000001)
+
+// The facets of a cube of side `s` as an ASCII STL.
+fn cube_stl(s: Float) -> Bytes
+    let v = [[0.0, 0.0, 0.0, 0.0, s, 0.0, s, s, 0.0], [0.0, 0.0, 0.0, s, s, 0.0, s, 0.0, 0.0], [0.0, 0.0, s, s, 0.0, s, s, s, s], [0.0, 0.0, s, s, s, s, 0.0, s, s],
+             [0.0, 0.0, 0.0, s, 0.0, 0.0, s, 0.0, s], [0.0, 0.0, 0.0, s, 0.0, s, 0.0, 0.0, s], [0.0, s, 0.0, 0.0, s, s, s, s, s], [0.0, s, 0.0, s, s, s, s, s, 0.0],
+             [0.0, 0.0, 0.0, 0.0, 0.0, s, 0.0, s, s], [0.0, 0.0, 0.0, 0.0, s, s, 0.0, s, 0.0], [s, 0.0, 0.0, s, s, 0.0, s, s, s], [s, 0.0, 0.0, s, s, s, s, 0.0, s]]
+    var text = "solid cube\n"
+    for f in v
+        text = text + "facet normal 0 0 0\nouter loop\nvertex ${f[0]} ${f[1]} ${f[2]}\nvertex ${f[3]} ${f[4]} ${f[5]}\nvertex ${f[6]} ${f[7]} ${f[8]}\nendloop\nendfacet\n"
+    bytes.from_str(text + "endsolid cube\n")
+
+// A line of the bill for a cube of side 10 at the origin.
+fn cube_line(volume: Float, z1: Float) -> BillLine
+    BillLine { part: "cube",
+        kind: "printed",
+        count: 1,
+        x0: 0.0,
+        y0: 0.0,
+        z0: 0.0,
+        x1: 10.0,
+        y1: 10.0,
+        z1: z1,
+        volume: volume }
+
+@test
+fn test_a_mesh_that_is_the_model_is_ok_and_one_that_is_not_says_how_it_differs()
+    let ok = encbill.mesh_report(cube_line(1000.0, 10.0), cube_stl(10.0), 0.001)
+    test.assert(ok.ok)
+    test.assert_eq(ok.box_error, 0.0)
+    test.assert_approx(ok.ratio, 1.0, 0.0000001)
+    let tall = encbill.mesh_report(cube_line(1000.0, 10.5), cube_stl(10.0), 0.001)
+    test.assert_eq(tall.ok, false)
+    test.assert_approx(tall.box_error, 0.5, 0.0000001)
+    let heavy = encbill.mesh_report(cube_line(900.0, 10.0), cube_stl(10.0), 0.001)
+    test.assert_eq(heavy.ok, false)
+    test.assert_approx(heavy.ratio, 1000.0 / 900.0, 0.0000001)
+    test.assert(str.contains(heavy.detail, "cube: box off by 0 mm, volume 1000 against 900"))
+
+@test
+fn test_a_mesh_that_does_not_read_is_reported_and_not_trusted()
+    let r = encbill.mesh_report(cube_line(1000.0, 10.0), bytes.from_str("not an stl"), 0.001)
+    test.assert_eq(r.ok, false)
+    test.assert_eq(r.box_error, -1.0)
+    test.assert(str.starts_with(r.detail, "the mesh does not read: "))

@@ -1,0 +1,40 @@
+[package]
+name        = "enclosure-nv"
+version     = "0.1.0"
+description = "A housing for a printed circuit board, computed from the facts of its KiCad board file and a few parameters: a base with standoffs at the mounting holes, a lid held by screws or by a snap, openings for the connectors that face an edge, and windows, light pipes and button caps for LEDs and buttons.  It writes OpenSCAD text, one file per part and an assembly with the parameters at the top, a bill of the printed parts with their bounding boxes and volumes, and checks the result without OpenSCAD."
+license     = "Apache-2.0"
+
+# `experimental` because no program outside this repository has used the
+# package yet.
+stability   = "experimental"
+
+# `core`: arithmetic over facts the caller already holds.  Every public
+# function declares `[]`.  The caller writes the text this package
+# returns.
+layer       = "core"
+
+category    = "graphics"
+
+tags        = ["enclosure", "housing", "openscad", "3d-printing", "kicad", "pcb", "case", "cad"]
+repository  = "https://github.com/novolang/enclosure-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.26.1"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A housing for a KiCad board, written as OpenSCAD text and checked without OpenSCAD"
+
+[dependencies]
+# The three packages below are SIBLING PATHS while they are unpublished:
+# the registry has no release of them yet.  `novo pkg publish` refuses a
+# path, so each line becomes a registry range (`^0.1.0`) once its
+# package is uploaded.
+kicad-pcb-nv = { path = "../kicad-pcb-nv" }
+
+# `sexpr-nv` and `stl-nv` are the dependencies of kicad-pcb-nv.  A
+# consumer of a path dependency names the closure itself, so both are
+# listed here as well.
+sexpr-nv = { path = "../sexpr-nv" }
+stl-nv = { path = "../stl-nv" }

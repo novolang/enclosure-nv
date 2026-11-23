@@ -1,0 +1,352 @@
+// enc_checks_tests — every check passes on a sound housing and fails,
+// naming the part, on a board or a parameter built to violate it.
+
+use std.test
+use std.bytes
+use kpcbgeom
+use kpcbboard
+use kpcbread
+use encmodel
+use encparams
+use encchecks
+
+// A board of `w` by `h` from (100, 100), with `body` after the outline.
+fn pcb(w: Float, h: Float, body: Str) -> Str
+    "(kicad_pcb\n  (version 20241229)\n  (general (thickness 1.6))\n  (gr_rect (start 100 100) (end ${100.0 + w} ${100.0 + h}) (layer \"Edge.Cuts\"))\n" + body + ")\n"
+
+// A non-plated mounting hole of drill `d` at (x, y).
+fn hole(ref: Str, x: Float, y: Float, d: Float) -> Str
+    "  (footprint \"MountingHole:MountingHole_${d}mm\" (layer \"F.Cu\") (at ${x} ${y})\n    (property \"Reference\" \"${ref}\" (at 0 0 0))\n    (pad \"\" np_thru_hole circle (at 0 0) (size ${d} ${d}) (drill ${d}) (layers \"*.Cu\"))\n  )\n"
+
+// A part with a courtyard of `hw` by `hh` either side of its origin.
+fn comp(ref: Str, lib: Str, x: Float, y: Float, hw: Float, hh: Float, layer: Str, extra: Str) -> Str
+    let court = if layer == "B.Cu"
+        "B.CrtYd"
+    else
+        "F.CrtYd"
+    "  (footprint \"${lib}\" (layer \"${layer}\") (at ${x} ${y})\n    (property \"Reference\" \"${ref}\" (at 0 0 0))\n" + extra + "    (fp_rect (start -${hw} -${hh}) (end ${hw} ${hh}) (stroke (width 0.05) (type solid)) (fill none) (layer \"${court}\"))\n  )\n"
+
+// A sound board: 40 by 30 with holes at two corners and a resistor.
+fn sound() -> Str
+    pcb(40.0,
+        30.0,
+        hole("H1", 104.0, 104.0, 3.2) + hole("H2", 136.0, 126.0, 3.2) + comp("R1", "Resistor_SMD:R_0603_1608Metric", 120.0, 115.0, 1.5, 0.75, "F.Cu", ""))
+
+// A sound board and a snap lid.
+fn snap() -> Params
+    var p = encparams.defaults()
+    p.lid = LidSnap
+    p.name = "t"
+    p
+
+// The housing of the board `text` with parameters `p`.
+fn housing_of(text: Str, p: Params) -> Housing
+    match kpcbread.read(bytes.from_str(text), "t.kicad_pcb")
+        Ok(b)  => encmodel.build(b, p)
+        Err(e) =>
+            test.assert_eq(e.message(), "")
+            encmodel.build(Board { file: "",
+                version: 0,
+                thickness: 1.6,
+                outline: [kpcbgeom.pt(0.0, 0.0), kpcbgeom.pt(1.0, 0.0), kpcbgeom.pt(1.0, 1.0)],
+                cutouts: [],
+                area: 0.0,
+                box: kpcbgeom.rect(0.0, 0.0, 1.0, 1.0),
+                holes: [],
+                parts: [] },
+            p)
+
+// The check named `name` of the housing, or a stand-in.
+fn check(h: Housing, name: Str) -> Check
+    match list.find(encchecks.run(h), c => c.name == name)
+        Some(c) => c
+        None    => Check { name: "missing ${name}", ok: false, severity: "", detail: "" }
+
+// A passing check: the name, then the verdict and the detail on failure.
+fn passes(h: Housing, name: Str) -> Bool
+    let c = check(h, name)
+    if not c.ok
+        test.assert_eq(c.detail, "")
+    c.ok
+
+@test
+fn test_a_sound_housing_passes_every_check()
+    let h = housing_of(sound(), snap())
+    let cs = encchecks.run(h)
+    test.assert_eq(list.len(cs), 14)
+    for c in cs
+        test.assert_eq(c.detail == "", false)
+        test.assert(c.ok)
+    test.assert(encchecks.passes(cs))
+    test.assert_eq(list.len(encchecks.failing(cs)), 0)
+
+@test
+fn test_the_report_has_one_line_for_each_check_and_says_which_failed()
+    var p = snap()
+    p.wall = 1.2
+    let cs = encchecks.run(housing_of(sound(), p))
+    let lines = str.split(encchecks.report(cs), "\n")
+    test.assert_eq(list.len(lines), 14)
+    test.assert(str.starts_with(lines[0], "error  wall-min  "))
+    test.assert(str.starts_with(lines[1], "ok  feature-min  "))
+
+@test
+fn test_a_wall_of_six_tenths_fails_the_wall_check_and_names_what_is_thin()
+    var p = snap()
+    p.wall = 1.2
+    let c = check(housing_of(sound(), p), "wall-min")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.severity, "error")
+    test.assert(str.contains(c.detail, "inner rim is 0.6 mm"))
+    test.assert(str.contains(c.detail, "wall is 1.2 mm") == false)
+    test.assert(str.contains(c.detail, "lid skirt is 0.4 mm"))
+
+@test
+fn test_a_floor_too_thin_under_the_screw_head_fails_the_wall_check_of_a_screwed_lid()
+    var p = encparams.defaults()
+    p.floor_t = 2.0
+    let c = check(housing_of(sound(), p), "wall-min")
+    test.assert_eq(c.ok, false)
+    test.assert(str.contains(c.detail, "floor under the screw head is 0.4 mm"))
+    test.assert(str.contains(c.detail, "pillar wall") == false)
+
+@test
+fn test_a_light_pipe_under_a_millimetre_fails_the_feature_check()
+    let led = comp("D1", "LED_SMD:LED_0603_1608Metric", 120.0, 110.0, 1.5, 0.75, "F.Cu", "")
+    var p = snap()
+    p.led_d = 0.8
+    let c = check(housing_of(pcb(40.0, 30.0, hole("H1", 104.0, 104.0, 3.2) + led), p), "feature-min")
+    test.assert_eq(c.ok, false)
+    test.assert(str.contains(c.detail, "D1 is 0.8 mm across"))
+    p.led = LedPipe
+    let c2 = check(housing_of(pcb(40.0, 30.0, hole("H1", 104.0, 104.0, 3.2) + led), p), "feature-min")
+    test.assert(str.contains(c2.detail, "pipe D1 is 0.8 mm across"))
+
+fn usb_at(y: Float, hh: Float) -> Str
+    comp("J1",
+        "Connector_USB:USB_C_Receptacle",
+        102.0,
+        y,
+        3.0,
+        hh,
+        "F.Cu",
+        "    (property \"Opening\" \"connector\" (at 0 0 0))\n")
+
+@test
+fn test_a_connector_two_millimetres_from_a_corner_has_no_straight_wall_to_open()
+    let text = pcb(40.0, 30.0, hole("H1", 120.0, 120.0, 3.2) + usb_at(102.0, 3.5))
+    let c = check(housing_of(text, snap()), "opening-in-wall")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.detail, "J1 is 6.8 mm wide on a wall of 40 mm, which leaves less than 2.4 mm to the corner")
+
+@test
+fn test_a_connector_taller_than_the_wall_has_its_opening_above_the_lid_line()
+    var p = snap()
+    p.top_space = 2.0
+    let text = pcb(40.0, 30.0, hole("H1", 120.0, 120.0, 3.2) + comp("J9",
+        "Connector_USB:USB_C_Receptacle",
+        102.0,
+        115.0,
+        3.0,
+        3.0,
+        "F.Cu",
+        "    (property \"Height\" \"6\" (at 0 0 0))\n"))
+    let c = check(housing_of(text, p), "opening-in-wall")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.detail, "J9 ends at z = 13.4, above the wall's top at 9")
+
+@test
+fn test_an_opening_below_the_floor_is_refused()
+    let hdr = "    (property \"Height\" \"1\" (at 0 0 0))\n"
+    let text = pcb(40.0, 30.0, hole("H1", 120.0, 120.0, 3.2) + comp("J3",
+        "Connector_Generic:Conn_01x02",
+        102.0,
+        110.0,
+        3.0,
+        3.0,
+        "B.Cu",
+        hdr + "    (property \"Opening\" \"connector\" (at 0 0 0))\n"))
+    var p = snap()
+    p.standoff_h = 1.0
+    let c = check(housing_of(text, p), "opening-in-wall")
+    test.assert_eq(c.ok, false)
+    test.assert(str.contains(c.detail, "J3 starts at z = "))
+    test.assert(str.contains(c.detail, ", below the floor's top at 2.4"))
+
+@test
+fn test_a_wall_opening_on_a_segment_that_does_not_exist_is_named()
+    var p = snap()
+    p.extras = [encparams.side_extra("ghost", 9, 5.0, 1.0, 4.0, 2.0)]
+    let c = check(housing_of(sound(), p), "opening-in-wall")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.detail, "ghost names no outline segment")
+
+@test
+fn test_a_hole_in_the_lid_off_the_board_fails_the_plate_check()
+    var p = snap()
+    p.extras = [encparams.lid_extra("vent", 500.0, 500.0, 4.0, 4.0),
+        encparams.floor_extra("round", 120.0, 115.0, 4.0, 4.0)]
+    let c = check(housing_of(sound(), p), "opening-in-plate")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.detail, "vent reaches past the board's outline")
+
+@test
+fn test_a_round_hole_partly_over_the_edge_fails_the_plate_check()
+    let led = comp("D1", "LED_SMD:LED_0603_1608Metric", 100.5, 110.0, 0.5, 0.5, "F.Cu", "")
+    let c = check(housing_of(pcb(40.0, 30.0, hole("H1", 120.0, 120.0, 3.2) + led), snap()), "opening-in-plate")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.detail, "D1 reaches past the board's outline")
+
+@test
+fn test_a_part_on_the_back_beside_a_standoff_fails_the_clearance_check()
+    let text = pcb(40.0,
+        30.0,
+        hole("H1", 104.0, 104.0, 3.2) + comp("C5", "Capacitor_SMD:C_0603_1608Metric", 105.0, 105.0, 1.5, 0.75, "B.Cu", ""))
+    let c = check(housing_of(text, snap()), "post-clear")
+    test.assert_eq(c.ok, false)
+    test.assert(str.contains(c.detail, "the standoff at H1 is -"))
+    test.assert(str.contains(c.detail, " mm from C5"))
+
+@test
+fn test_a_tall_part_beside_a_pillar_fails_the_clearance_check_of_a_screwed_lid_only()
+    let text = pcb(40.0,
+        30.0,
+        hole("H1", 104.0, 104.0, 3.2) + comp("U1", "Package_SO:SOIC-8", 107.0, 104.0, 3.0, 3.0, "F.Cu", ""))
+    let screwed = check(housing_of(text, encparams.defaults()), "post-clear")
+    test.assert_eq(screwed.ok, false)
+    test.assert(str.contains(screwed.detail, "the pillar at H1 is "))
+    test.assert(str.contains(screwed.detail, " from U1"))
+    test.assert(passes(housing_of(text, snap()), "post-clear"))
+
+@test
+fn test_a_hole_narrower_than_the_screw_fails_the_hole_check()
+    let text = pcb(40.0, 30.0, hole("H1", 104.0, 104.0, 3.2) + hole("H2", 136.0, 126.0, 2.5))
+    var p = snap()
+    p.mount_min_drill = 2.0
+    let c = check(housing_of(text, p), "screw-hole-fit")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.detail, "the hole at H2 is 2.5 mm for a 2.5 mm screw")
+
+@test
+fn test_a_hole_near_the_edge_leaves_a_standoff_hanging_over_it()
+    let text = pcb(40.0, 30.0, hole("H1", 101.0, 101.0, 3.2))
+    let c = check(housing_of(text, snap()), "post-on-board")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.detail, "the standoff at H1 overhangs the board's edge")
+
+@test
+fn test_a_lid_closer_than_the_headroom_to_the_tallest_part_fails()
+    var p = snap()
+    p.top_space = 1.0
+    let c = check(housing_of(sound(), p), "lid-headroom")
+    test.assert_eq(c.ok, false)
+    test.assert(str.contains(c.detail, "the lid leaves 0.55 mm over a part 0.45 mm tall, not the 1 mm asked for"))
+    test.assert(passes(housing_of(sound(), snap()), "lid-headroom"))
+
+@test
+fn test_standoffs_lower_than_the_part_under_the_board_fail()
+    let text = pcb(40.0,
+        30.0,
+        hole("H1", 104.0, 104.0, 3.2) + comp("C1", "Capacitor_SMD:C_0805_2012Metric", 120.0, 115.0, 1.5, 1.0, "B.Cu", ""))
+    var p = snap()
+    p.standoff_h = 1.5
+    let c = check(housing_of(text, p), "bottom-headroom")
+    test.assert_eq(c.ok, false)
+    test.assert(str.contains(c.detail, "the standoffs leave 0.25 mm under a part 1.25 mm tall, not the 1 mm asked for"))
+
+@test
+fn test_a_part_that_hangs_off_the_board_into_the_wall_fails_the_cavity_check()
+    let text = pcb(40.0,
+        30.0,
+        hole("H1", 104.0, 104.0, 3.2) + comp("U7", "Package_SO:SOIC-8", 139.0, 115.0, 4.0, 3.0, "F.Cu", ""))
+    let c = check(housing_of(text, snap()), "in-cavity")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.detail, "U7 reaches into the wall")
+    // The same part with an opening made for it is allowed to reach the wall.
+    let text2 = pcb(40.0,
+        30.0,
+        hole("H1", 104.0, 104.0, 3.2) + comp("J7", "Connector_Generic:Conn_01x02", 139.0, 115.0, 4.0, 3.0, "F.Cu", ""))
+    test.assert(passes(housing_of(text2, snap()), "in-cavity"))
+    // And a part off the edge by less than the clearance is inside the wall.
+    let text3 = pcb(40.0,
+        30.0,
+        hole("H1", 104.0, 104.0, 3.2) + comp("U8", "Package_SO:SOIC-8", 139.0, 115.0, 1.4, 3.0, "F.Cu", ""))
+    test.assert(passes(housing_of(text3, snap()), "in-cavity"))
+
+@test
+fn test_a_screwed_lid_over_a_low_board_has_no_pillar_deep_enough_for_the_screw()
+    let c = check(housing_of(sound(), encparams.defaults()), "screw-fit")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.detail, "the screw's hole is 3.5 mm deep and the pillar leaves 2.25 mm above its skin")
+
+@test
+fn test_a_standoff_too_short_for_the_snap_lids_screw_fails()
+    var p = snap()
+    p.standoff_min = 0.5
+    p.floor_t = 1.6
+    p.engage_min = 6.0
+    let c = check(housing_of(sound(), p), "screw-fit")
+    test.assert_eq(c.ok, false)
+    test.assert(str.contains(c.detail, "the standoff leaves"))
+
+@test
+fn test_a_thread_no_screw_can_give_fails_the_screw_check_and_a_board_without_posts_has_none_to_check()
+    var p = snap()
+    p.engage_min = 80.0
+    let c = check(housing_of(sound(), p), "screw-fit")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.detail, "no standard screw is long enough for 80 mm of thread")
+    let bare = check(housing_of(pcb(40.0, 30.0, ""), snap()), "screw-fit")
+    test.assert(bare.ok)
+
+@test
+fn test_a_board_with_no_mounting_hole_is_held_by_nothing()
+    let c = check(housing_of(pcb(40.0, 30.0, ""), snap()), "mount-holes")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.detail, "the board has no mounting hole of 2 mm or more: nothing holds it")
+
+@test
+fn test_a_connector_far_from_every_edge_warns_until_an_opening_covers_it()
+    let text = pcb(40.0,
+        30.0,
+        hole("H1", 104.0, 104.0, 3.2) + comp("J2", "Connector_Generic:Conn_01x04", 120.0, 115.0, 5.0, 2.0, "F.Cu", ""))
+    let c = check(housing_of(text, snap()), "connector-reach")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.severity, "warning")
+    test.assert_eq(c.detail, "J2 faces no edge and no extra opening covers it")
+    var p = snap()
+    p.extras = [encparams.lid_extra("window", 120.0, 115.0, 12.0, 6.0)]
+    test.assert(passes(housing_of(text, p), "connector-reach"))
+    p.extras = [encparams.floor_extra("elsewhere", 105.0, 105.0, 3.0, 3.0)]
+    test.assert_eq(check(housing_of(text, p), "connector-reach").ok, false)
+
+@test
+fn test_a_round_opening_covers_a_connector_by_its_centre()
+    let near = comp("D2", "LED_SMD:LED_0603", 120.5, 115.0, 1.0, 1.0, "F.Cu", "")
+    let far = comp("D2", "LED_SMD:LED_0603", 124.0, 115.0, 1.0, 1.0, "F.Cu", "")
+    let conn = comp("J2", "Connector_Generic:Conn_01x04", 120.0, 115.0, 5.0, 2.0, "F.Cu", "")
+    test.assert(passes(housing_of(pcb(40.0, 30.0, hole("H1", 104.0, 104.0, 3.2) + conn + near), snap()),
+        "connector-reach"))
+    test.assert_eq(check(housing_of(pcb(40.0, 30.0, hole("H1", 104.0, 104.0, 3.2) + conn + far), snap()),
+        "connector-reach").ok,
+    false)
+
+@test
+fn test_parts_without_a_known_height_are_a_warning_that_names_the_first_eight()
+    var body = hole("H1", 104.0, 104.0, 3.2)
+    for i in 0..10
+        body = body + comp("U${i}", "Custom:Thing", 110.0 + i as Float * 2.0, 115.0, 0.8, 0.8, "F.Cu", "")
+    let c = check(housing_of(pcb(40.0, 30.0, body), snap()), "heights-known")
+    test.assert_eq(c.ok, false)
+    test.assert_eq(c.severity, "warning")
+    test.assert_eq(c.detail, "10 part(s) have no known height and count as 1 mm: U0, U1, U2, U3, U4, U5, U6, U7")
+    test.assert(encchecks.passes(encchecks.run(housing_of(pcb(40.0, 30.0, body), snap()))))
+
+@test
+fn test_a_failing_error_makes_the_housing_fail_and_a_warning_does_not()
+    let warn = Check { name: "w", ok: false, severity: "warning", detail: "d" }
+    let err = Check { name: "e", ok: false, severity: "error", detail: "d" }
+    let good = Check { name: "g", ok: true, severity: "error", detail: "d" }
+    test.assert(encchecks.passes([good, warn]))
+    test.assert(encchecks.passes([good, err]) == false)
+    test.assert_eq(list.len(encchecks.failing([good, warn, err])), 2)
