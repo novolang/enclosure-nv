@@ -179,13 +179,13 @@ fn test_standoffs_stand_on_the_mounting_holes_to_a_hundredth_of_a_millimetre() [
     test.assert_eq(h.posts[0].hole, 3.2)
 
 @test
-fn test_a_locating_pin_is_no_standoff_and_a_larger_minimum_drops_the_small_holes() [fs]
+fn test_a_locating_pin_is_no_standoff_whatever_the_minimum_drill() [fs]
     let a = fixture("usbc_board", encparams.defaults())
     test.assert_eq(list.len(a.posts), 2)
     var p = encparams.defaults()
     p.mount_min_drill = 0.5
     let b = fixture("usbc_board", p)
-    test.assert_eq(list.len(b.posts), 3)
+    test.assert_eq(list.len(b.posts), 2)
 
 // ── Wall openings ───────────────────────────────────────────────────
 
@@ -465,6 +465,7 @@ fn test_a_known_part_has_its_height_and_an_unknown_one_the_parameters_stand_in()
                         rot: 0.0,
                         side: "F",
                         kind: "other",
+                        pads: 0,
                         cx0: 0.0,
                         cy0: 0.0,
                         cx1: 0.0,
