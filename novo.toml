@@ -27,14 +27,10 @@ novo        = ">= 0.26.1"
 "README.md" = "A housing for a KiCad board, written as OpenSCAD text and checked without OpenSCAD"
 
 [dependencies]
-# The three packages below are SIBLING PATHS while they are unpublished:
-# the registry has no release of them yet.  `novo pkg publish` refuses a
-# path, so each line becomes a registry range (`^0.1.0`) once its
-# package is uploaded.
-kicad-pcb-nv = { path = "../kicad-pcb-nv" }
+# The reader of a KiCad board.
+kicad-pcb-nv = "^0.1.0"
 
-# `sexpr-nv` and `stl-nv` are the dependencies of kicad-pcb-nv.  A
-# consumer of a path dependency names the closure itself, so both are
-# listed here as well.
-sexpr-nv = { path = "../sexpr-nv" }
-stl-nv = { path = "../stl-nv" }
+# `sexpr-nv` and `stl-nv` are the dependencies of kicad-pcb-nv; a
+# consumer names the closure its modules use itself.
+sexpr-nv = "^0.1.0"
+stl-nv = "^0.1.0"
